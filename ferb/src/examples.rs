@@ -26,6 +26,7 @@ fn jit_add() {
             name: Slice::from(name.as_bytes()),
             p: 0,
             m: 0,
+            jit: 1,
         };
         compile_one(fr, &mut cmd);
         let f: fn(a: i64, b: i64) -> i64 = std::mem::transmute(cmd.p); 

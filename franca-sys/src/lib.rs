@@ -20,6 +20,7 @@ pub struct CompileCmd<'a> {
     pub name: Slice<'a>,
     pub p: u64,
     pub m: u64,
+    pub jit: u8,
 }
 
 unsafe extern "C" {

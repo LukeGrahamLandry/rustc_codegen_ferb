@@ -1,6 +1,6 @@
 #![feature(rustc_private)]
 
-use std::{any::Any, process::Command};
+use std::any::Any;
 
 use rustc_codegen_ssa::{
     CodegenResults, CompiledModule, CrateInfo, ModuleKind, traits::CodegenBackend,
@@ -73,36 +73,7 @@ impl CodegenBackend for FerbCodegenBackend {
         let OutFileName::Real(fake_output) = outputs.path(OutputType::Object) else {
             panic!("TODO: OutFileName")
         };
-        std::fs::write(
-            "tempfile.ssa",
-            r#"
-            data $msg = { b "Hello\0" }
-            export function w $main() {
-            @start
-                call $puts(l $msg)
-                ret 24
-            }
-        "#
-            .as_bytes(),
-        )
-        .unwrap();
-        let path = fake_output.as_os_str().to_str().unwrap();
-        let status = Command::new("franca")
-            .args([
-                "backend/meta/qbe_frontend.fr",
-                "-c",
-                "tempfile.ssa",
-                "-o",
-                path,
-            ])
-            .output()
-            .expect("run franca");
-        assert!(
-            status.status.success(),
-            "{}",
-            String::try_from(status.stderr).unwrap()
-        );
-        println!("{:?}", fake_output);
+        std::fs::write(&fake_output, fake_object_file()).unwrap();
 
         let result = CompiledModule {
             name: worker.cgu_name,
@@ -130,4 +101,29 @@ impl CodegenBackend for FerbCodegenBackend {
 #[unsafe(no_mangle)]
 pub fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
     Box::new(FerbCodegenBackend {})
+}
+
+fn fake_object_file() -> Vec<u8> {
+    use ferb::builder::*;
+    let mut m = Module::new();
+    
+    let (msg, puts) = (m.sym("msg"), m.sym("puts"));
+    let libc = m.library("libc");
+    m.import(puts, libc);
+    m.data(Data {
+        id: msg,
+        segment: Seg::ConstantData,
+        template: Template::Bytes("Hello\0".as_bytes()),
+        rel: vec![],
+    });
+    
+    let mut f = Func::new(m.sym("main"), Ret::K(Cls::Kl));
+    let (msg, puts, b) = (f.con(msg, 0), f.con(puts, 0), f.blk());
+    f.emit(b, O::arg, Cls::Kl, Ref::Null, msg, Ref::Null);
+    f.emit(b, O::call, Cls::Kl, Ref::Null, puts, Ref::Null);
+    let c = f.con(Id::None, 24);
+    f.jump(b, J::retl, c, None, None);
+    m.func(f);
+    
+    ferb::compile_aot(&m.finish())
 }

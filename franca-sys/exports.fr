@@ -6,12 +6,23 @@ Globals :: @struct {
 };
 globals :: @static(Globals);
 
+
+host_os :: {
+    // when compiled by build.rs, it always passes -arch,-os. 
+    // this is the host franca-sys will run on (not the host build.rs is running on)
+    i := cli_args().index_of(fn(it) => it[] == "-os").expect("-os");
+    os := cli_args().index(i + 1)[];
+    os := Os.from_name(os.str());
+    os.unwrap()
+};
+
 fn init_globals() *Globals #export = {
+    @if(globals.stack.usable.len > 0) return(globals);
     // TODO: this won't work on linux if not linking libc
-    stack := import("@/lib/sys/threads.fr")'allocate_stack(true, .macos);
+    stack := import("@/lib/sys/threads.fr")'allocate_stack(true, host_os);
     thread := bit_cast_unchecked(*u8, *Thread, stack.usable.ptr);
     thread.stack = stack;
-    thread.first_environment.current_os = (@as(i64) Os.macos).trunc();
+    thread.first_environment.current_os = (@as(i64) host_os.raw()).trunc();
     thread.stack_reserved_size = 1.shift_left(16);
 
     globals.stack = stack;
@@ -36,6 +47,7 @@ CompileCmd :: @struct {
     name: Str;
     p: rawptr;
     m: *Qbe.Module;
+    jit: u8;
 };
 
 fn compile_one(_: *Globals, arg: *CompileCmd) void #export = {
@@ -43,7 +55,7 @@ fn compile_one(_: *Globals, arg: *CompileCmd) void #export = {
         m := general_allocator().box_zeroed(Qbe.Module);
         // TODO: pass this in so can cross compile
         Qbe'backend'init_module(m, (
-            type = .JitOnly, 
+            type = @if(arg.jit == 0, .Relocatable, .JitOnly), 
             os = query_current_os(),  
             arch = query_current_arch(), 
         ));
@@ -73,7 +85,10 @@ fn compile_one(_: *Globals, arg: *CompileCmd) void #export = {
 
 fn drop_module(_: *Globals, arg: *CompileCmd) void #export = {
     call_in_stack(*CompileCmd, void, arg, fn(arg) => {
-        arg.m.drop();
+        ::ptr_utils(@type arg.m[]);
+        if !arg.m.is_null() {
+            arg.m.drop();
+        };
         general_allocator().dealloc(u8, arg.out);
         general_allocator().dealloc_one(Qbe.Module, arg.m);
         arg.m = zeroed(*Qbe.Module);

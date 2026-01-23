@@ -16,6 +16,7 @@ pub struct Module {
     symbols: HashMap<String, Id<Sym>>,
 }
 
+#[derive(Debug)]
 pub struct Func {
     id: Id<Sym>,
     blocks: Vec<Block>,
@@ -24,9 +25,17 @@ pub struct Func {
     ntmp: usize,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Ret {
+    K(Cls),
+    Void,
+    T(Ref),
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct BlkId(u32);
 
+#[derive(Debug)]
 pub struct Block {
     ins: Vec<Ins>,
     phi: Vec<Phi>,
@@ -34,10 +43,40 @@ pub struct Block {
     jmp: BlkJmp,
 }
 
+#[derive(Debug)]
 pub struct Phi {
     pub to: Ref,
     pub cls: Cls,
     pub cases: Vec<(BlkId, Ref)>
+}
+
+#[derive(Debug)]
+pub struct Data<'a> {
+    pub id: Id<Sym>,
+    pub segment: Seg,
+    pub template: Template<'a>,
+    pub rel: Vec<Reloc>,
+}
+
+#[derive(Clone, Debug)]
+pub enum Template<'a> {
+    Bytes(&'a [u8]),
+    Zeroes(usize),
+}
+
+#[derive(Clone, Debug)]
+pub struct TypeLayout {
+    pub size: usize,
+    pub align: usize,
+    pub cases: Vec<Vec<Field>>,
+    pub is_union: bool,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Field {
+    Scalar(FieldType),
+    Struct(Ref),  // RType from Module::typ
+    Pad(u32),
 }
 
 impl Module {
@@ -97,7 +136,7 @@ impl Module {
         }
         
         let sym = &mut self.sym[id];
-        assert_eq!(sym.segment, Seg::Invalid, "redeclared function {:?}", id);
+        debug_assert_eq!(sym.segment, Seg::Invalid, "redeclared {:?}", id);
         sym.segment = Seg::Code;
         sym.payload.fnc = Fnc {
             reg: 0,
@@ -126,6 +165,72 @@ impl Module {
             }
         };
         Id::new(phi)
+    }
+    
+    pub fn data(&mut self, d: Data) {
+        let rel_off = self.rel.len();
+        self.rel.extend(&d.rel);
+        let bytes = match d.template {
+            Template::Bytes(it) => self.bytes(it),
+            Template::Zeroes(count) => Idx::new(u32::MAX as usize, count),
+        };
+        let sym = &mut self.sym[d.id.off as usize];
+        debug_assert_eq!(sym.segment, Seg::Invalid, "redeclared {:?}", d.id);
+        sym.segment = d.segment;
+        sym.payload.dat = Dat {
+            bytes,
+            rel: Idx::new(rel_off, d.rel.len()),
+        };
+        for it in &d.rel {
+            debug_assert!(it.off % 8 == 0 && it.off < bytes.count);
+        }
+        debug_assert!(matches!(d.segment, Seg::ConstantData | Seg::MutableData));
+    }
+    
+    pub fn import(&mut self, id: Id<Sym>, lib: Id<Lib>) {
+        let sym = &mut self.sym[id.off as usize];
+        debug_assert_eq!(sym.segment, Seg::Invalid, "redeclared {:?}", id);
+        sym.segment = Seg::Import;
+        sym.payload.imp = Imp { 
+            lib,
+            weak: false,  // TODO
+            _0: 0,
+        };
+    }
+    
+    pub fn library(&mut self, name: &str) -> Id<Lib> {
+        let name = self.bytes(name.as_bytes());
+        self.lib.push(Lib {
+            name,
+        });
+        Id::new(self.lib.len() - 1)
+    }
+    
+    // TODO: maybe i should do the layout here instead of making the caller deal with it
+    pub fn typ(&mut self, t: TypeLayout) -> Ref {
+        let fields_off = self.idx.len();
+        debug_assert!(t.is_union || t.cases.len() <= 1);
+        for case in &t.cases {
+            self.idx.reserve(case.len() + 1);
+            for &it in case {
+                let (tag, data) = match it {
+                    Field::Scalar(it) => (it, field_size(it).expect("primitive field")),
+                    Field::Struct(it) => (FieldType::FTyp, it.0 >> 3),
+                    Field::Pad(n) => (FieldType::FPad, n),
+                };
+                self.idx.push(pack_field(tag, data));
+            }
+            self.idx.push(pack_field(FieldType::FEnd, 0));
+        }
+        debug_assert!(t.size < (1 << 29), "type too large");
+        self.typ.push(Typ {
+            size: t.size as u32,
+            nunion: t.cases.len() as u16,
+            align_log2: t.align.trailing_zeros() as u8,
+            flags: pack_typ_flags(t.cases.len() == 0, t.is_union),
+            fields: Idx::new(fields_off, self.idx.len() - fields_off),
+        });
+        pack_ref(RefKind::RType, self.typ.len() as u32 - 1)
     }
     
     pub fn finish(self) -> Vec<u8> {
@@ -184,15 +289,8 @@ impl Module {
             items,
         };
         out[0..size_of::<Header>()].copy_from_slice(cast_to_bytes(&[h]));
-        
         out
     }
-}
-
-pub enum Ret {
-    K(Cls),
-    Void,
-    T(Ref),
 }
 
 impl Func {
@@ -207,6 +305,18 @@ impl Func {
             ret,
             ntmp: 64,
         }
+    }
+    
+    pub fn con(&mut self, sym: Id<Sym>, i: i64) -> Ref {
+        let trunc = |i| (i & (u32::MAX as i64)) as u32;
+        let con = Con { sym, bits: [trunc(i), trunc(i >> 32)], };
+        for (i, it) in self.con.iter().enumerate().skip(1) {
+            if it == &con {
+                return pack_ref(RefKind::RCon, i as u32);
+            }
+        }
+        self.con.push(con);
+        pack_ref(RefKind::RCon, self.con.len() as u32 - 1)
     }
     
     pub fn tmp(&mut self) -> Ref {
@@ -240,4 +350,23 @@ impl Func {
         b.jmp = BlkJmp { kind, arg, };
         b.s = [s1, s2];
     }
+    
+    pub fn blit(&mut self, b: BlkId, dest: Ref, src: Ref, n: usize) {
+        debug_assert!(n < (1 << 29), "blit too large");
+        let n = pack_ref(RefKind::RInt, n as u32);
+        self.emit(b, O::blit0, Cls::Kw, Ref::Null, src, dest);
+        self.emit(b, O::blit1, Cls::Kw, Ref::Null, n, Ref::Null);
+    }
+}
+
+fn field_size(it: FieldType) -> Option<u32> {
+    Some(match it {
+        FieldType::Fb => 1,
+        FieldType::Fh => 2,
+        FieldType::Fw => 4,
+        FieldType::Fl => 8,
+        FieldType::Fs => 4,
+        FieldType::Fd => 8,
+        _ => return None,
+    })
 }

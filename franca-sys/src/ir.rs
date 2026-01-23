@@ -148,7 +148,7 @@ pub struct BlkJmp {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Con {
     pub bits: [u32; 2],
     pub sym: Id<Sym>,
@@ -356,8 +356,8 @@ pub const fn pack_fnc_flags(var_arg: bool, ret_cls: u32) -> u32 {
     (ret_cls << 7) | ((var_arg as u32) << 1)
 }
 
-pub const fn pack_typ_flags(dark: bool, union: bool) -> u32 {
-    (dark as u32) | (union as u32) << 1
+pub const fn pack_typ_flags(dark: bool, union: bool) -> u8 {
+    (dark as u8) | (union as u8) << 1
 }
 
 pub const fn pack_field(kind: FieldType, len: u32) -> u32 {
@@ -395,6 +395,20 @@ impl<T> Idx<T> {
             count: count as u32,
             _0: PhantomData,
         }
+    }
+}
+
+// ugh, can't derive if the generic doesn't implement the trait
+
+impl<T> PartialEq for Id<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.off == other.off
+    }
+}
+
+impl<T> PartialEq for Idx<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.off == other.off && self.count == other.count
     }
 }
 
