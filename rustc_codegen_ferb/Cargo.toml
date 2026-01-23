@@ -1,0 +1,13 @@
+[package]
+name = "rustc_codegen_ferb"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["dylib"]
+
+[dependencies]
+ferb = { path = "../ferb" }
+
+[package.metadata.rust-analyzer]
+rustc_private = true
