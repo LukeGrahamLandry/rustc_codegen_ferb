@@ -291,6 +291,11 @@ impl Module {
         out[0..size_of::<Header>()].copy_from_slice(cast_to_bytes(&[h]));
         out
     }
+    
+    // this is what it's called in the franca codebase so it's what i automatically type
+    pub fn intern(&mut self, name: &str) -> Id<Sym> {
+        self.sym(name)
+    }
 }
 
 impl Func {
@@ -324,7 +329,8 @@ impl Func {
         pack_ref(RefKind::RTmp, self.ntmp as u32 - 1)
     }
     
-    pub fn emit(&mut self, b: BlkId, o: O, k: Cls, to: Ref, a0: Ref, a1: Ref) {
+    pub fn emit(&mut self, b: BlkId, o: O, k: Cls, to: impl Reflike, a0: impl Reflike, a1: impl Reflike) {
+        let (to, a0, a1) = (to.r(self), a0.r(self), a1.r(self));
         self.blocks[b.0 as usize].ins.push(Ins {
             op_cls: pack_op_cls(o, k),
             to: to,
@@ -345,7 +351,8 @@ impl Func {
         BlkId(self.blocks.len() as u32 - 1)
     }
     
-    pub fn jump(&mut self, b: BlkId, kind: J, arg: Ref, s1: Option<BlkId>, s2: Option<BlkId>) {
+    pub fn jump(&mut self, b: BlkId, kind: J, arg: impl Reflike, s1: Option<BlkId>, s2: Option<BlkId>) {
+        let arg = arg.r(self);
         let b = &mut self.blocks[b.0 as usize];
         b.jmp = BlkJmp { kind, arg, };
         b.s = [s1, s2];
@@ -356,6 +363,15 @@ impl Func {
         let n = pack_ref(RefKind::RInt, n as u32);
         self.emit(b, O::blit0, Cls::Kw, Ref::Null, src, dest);
         self.emit(b, O::blit1, Cls::Kw, Ref::Null, n, Ref::Null);
+    }
+    
+    pub fn tmps<const N: usize>(&mut self) -> [Ref; N] {
+        // this is what i want: (0..N).map(|_| self.tmp()).collect::<[Ref; N]>();
+        let mut it = [Ref::Null; N];
+        for it in &mut it {
+            *it = self.tmp();
+        }
+        it
     }
 }
 
@@ -369,4 +385,31 @@ fn field_size(it: FieldType) -> Option<u32> {
         FieldType::Fd => 8,
         _ => return None,
     })
+}
+
+// this exists because you can't call f.emit(_, _, _, f.con(Id::None, 0), _) 
+// because it counts as two mutable references. this lets it work without always adding extra name bindings.
+
+pub trait Reflike {
+    fn r(self, f: &mut Func) -> Ref;
+}
+impl Reflike for Ref {
+    fn r(self, _: &mut Func) -> Ref {
+        self
+    }
+}
+impl Reflike for Id<Sym> {
+    fn r(self, f: &mut Func) -> Ref {
+        f.con(self, 0)
+    }
+}
+impl Reflike for i64 {
+    fn r(self, f: &mut Func) -> Ref {
+        f.con(Id::None, self)
+    }
+}
+impl Reflike for () {
+    fn r(self, _: &mut Func) -> Ref {
+        Ref::Null
+    }
 }

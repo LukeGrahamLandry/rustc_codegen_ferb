@@ -12,5 +12,5 @@ cargo build
 cd target
 # RUSTC_ICE=0 makes it not create rustc-ice-DATE.txt when i crash
 # which happens a lot :(
-RUSTC_ICE=0 rustc -Z "$cg" -C panic=abort ../tests/hello.rs -lc
+RUSTC_ICE=0 rustc -Z "$cg" -C panic=abort ../tests/hello.rs -lc -Z dump-mir=" & PreCodegen"
 ./hello || echo "status = $?"
