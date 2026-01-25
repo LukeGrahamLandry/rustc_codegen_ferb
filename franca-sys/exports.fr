@@ -7,6 +7,10 @@ Globals :: @struct {
 globals :: @static(Globals);
 
 
+
+
+
+
 host_os :: {
     // when compiled by build.rs, it always passes -arch,-os. 
     // this is the host franca-sys will run on (not the host build.rs is running on)
@@ -111,15 +115,16 @@ call_in_stack :: fn($A: Type, $R: Type, in: A, $f: @Fn(a: A) R) R #generic = {
     out[]
 }
 
-// TODO: HACK HACK HACK HACK HACK HACK HACK HACK
+// macos linker doesn't like weak symbols by default idk how to ask cargo to ask for them. 
 //       doesn't work: println!("cargo::rustc-link-arg=-Wl,-undefined,dynamic_lookup");
-// TODO: this won't work on linux if linking libc
+::@if(@run(host_os == .macos)) {  // HACK
 fn __errno_location() void #export = todo();
 fn FR_openat() void #export = todo();
 fn @"fstatat$INODE64"() void #export = todo();
 fn FR_wasm_jit_event() void #export = todo();
 fn jit_instantiate_module() void #export = todo();
 fn ppoll() void #export = todo();
+};
 
 #use("@/lib/sys/threads.fr");
 Qbe :: import("@/backend/lib.fr").Qbe;    

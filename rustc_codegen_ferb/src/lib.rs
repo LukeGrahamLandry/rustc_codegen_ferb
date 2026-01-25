@@ -3,7 +3,7 @@
 use std::any::Any;
 
 use rustc_codegen_ssa::{
-    CodegenResults, CompiledModule, CrateInfo, ModuleKind, traits::CodegenBackend,
+    CodegenResults, CompiledModule, CrateInfo, ModuleKind, TargetConfig, traits::CodegenBackend
 };
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_middle::{
@@ -14,6 +14,8 @@ use rustc_session::{
     Session,
     config::{OutFileName, OutputFilenames, OutputType},
 };
+use rustc_span::{sym, Symbol};
+use rustc_target::spec::Arch;
 
 extern crate rustc_abi;
 extern crate rustc_ast;
@@ -95,6 +97,26 @@ impl CodegenBackend for FerbCodegenBackend {
             },
             work_products,
         )
+    }
+    
+    // im clealy not at the point of caring about this 
+    // but it fixes warning spam every time rustc runs.
+    // "warning: target feature $whatever must be enabled to ensure that the ABI of the current target can be implemented correctly"
+    fn target_config(&self, sess: &Session) -> TargetConfig {
+        let f = match sess.target.arch {
+            Arch::AArch64 => vec![sym::neon],
+            Arch::X86_64 => vec![Symbol::intern("x87")],
+            _ => vec![],
+        };
+
+        TargetConfig {
+            target_features: f.clone(),
+            unstable_target_features: f,
+            has_reliable_f16: false,
+            has_reliable_f16_math: false,
+            has_reliable_f128: false,
+            has_reliable_f128_math: false,
+        }
     }
 }
 

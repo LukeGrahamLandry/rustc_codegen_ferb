@@ -11,33 +11,25 @@ pub fn main() {
     println!("cargo::rustc-link-lib=franca");
     println!("cargo::rustc-link-search={}", dir);
     
-    let o_path = &*format!("{}/libfranca.o", dir);
+    // it will only look for a .a file but it seems fine that the contents is just a .o file without the wrapper. 
     let a_path = &*format!("{}/libfranca.a", dir);
     let franca = find_compiler();
     let status = Command::new(franca)
         .env("FRANCA_NO_CACHE", "1")  // irritating when i make a new target/ directory
         .args([
                 "examples/default_driver.fr", "build", "exports.fr", 
-                "-o", o_path, "-c",
+                "-o", a_path, 
                 "-keep-names",
                 "-arch", arch, "-os", os,
+                "-c", 
         ])
         .output()
         .expect("run franca");
-    assert!(
-        status.status.success(),
-        "{}",
-        String::try_from(status.stderr).unwrap()
-    );
     
-    // TODO: do this myself
-    let status = Command::new("ar")
-        .args(["rc", a_path, o_path])
-        .output()
-        .expect("run franca");
     assert!(
         status.status.success(),
-        "{}",
+        "{}\n{}",
+        String::try_from(status.stdout).unwrap(),
         String::try_from(status.stderr).unwrap()
     );
 }
