@@ -296,6 +296,10 @@ impl Module {
     pub fn intern(&mut self, name: &str) -> Id<Sym> {
         self.sym(name)
     }
+
+    pub fn anon(&mut self) -> Id<Sym> {
+        self.sym(&*format!("__R{}", self.sym.len()))
+    }
 }
 
 impl Func {

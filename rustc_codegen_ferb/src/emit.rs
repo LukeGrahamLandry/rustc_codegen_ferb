@@ -1,18 +1,19 @@
-use rustc_const_eval::interpret::Scalar;
+use rustc_const_eval::interpret::{GlobalAlloc, Scalar, alloc_range};
 use rustc_index::{Idx, IndexVec};
-use rustc_middle::{mir::{BasicBlock, BasicBlockData, Body, Const, ConstValue, Local, Operand, Rvalue, StatementKind, TerminatorKind, mono::{CodegenUnit, MonoItem}}, ty::{InstanceKind, TyCtxt}};
+use rustc_middle::{mir::{BasicBlock, BasicBlockData, ConstOperand, ConstValue, Local, Operand, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, mono::{CodegenUnit, MonoItem}}, ty::{EarlyBinder, Instance, TyCtxt, TyKind, TypingEnv}};
 use ferb::builder as Ferb;
 use Ferb::Cls::*;
 use Ferb::{J, O};
+use rustc_abi::Size;
 
 struct Emit<'f, 'tcx> {
     tcx: TyCtxt<'tcx>,
     m: &'f mut Ferb::Module,
     f: &'f mut Ferb::Func,
-    mir: &'tcx Body<'tcx>,
     b: Ferb::BlkId,
     blocks: IndexVec<BasicBlock, Ferb::BlkId>,
     locals: IndexVec<Local, Ferb::Ref>,
+    instance: Instance<'tcx>,
 }
 
 pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Module {
@@ -32,7 +33,7 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
                     b: start_block,
                     m: &mut m,
                     f: &mut f,
-                    mir,
+                    instance: it,
                 };
                 emit.f.jump(emit.b, J::jmp, (), Some(emit.blocks[BasicBlock::new(0)]), None);
                 for (bid, blk) in mir.basic_blocks.iter_enumerated() {
@@ -50,7 +51,7 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
 }
 
 impl<'f, 'tcx> Emit<'f, 'tcx> {
-    fn emit_block(&mut self, blk: &BasicBlockData) {
+    fn emit_block(&mut self, blk: &BasicBlockData<'tcx>) {
         for stmt in &blk.statements {
             match &stmt.kind {
                 StatementKind::Assign(box (place, value)) => {
@@ -68,39 +69,91 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 self.f.jump(self.b, J::jmp, (), Some(self.blocks[target]), None);
             }
             TerminatorKind::Return => {
-                self.f.jump(self.b, J::retw, self.locals[Local::new(0)], None, None);
+                self.f.jump(self.b, J::retw, self.locals[RETURN_PLACE], None, None);
             }
-            _ => todo!(),
+            TerminatorKind::Call { func, args, destination, target, .. } => {
+                let dest = self.locals[destination.local];
+                let callee = self.emit_operand(func);
+                for arg in args {
+                    let arg = self.emit_operand(&arg.node);
+                    self.f.emit(self.b, O::arg, Kl, (), arg, ());
+                }
+                self.f.emit(self.b, O::call, Kl, dest, callee, ());
+                let j = target.map(|_| J::jmp).unwrap_or(J::hlt);
+                let target = target.map(|it| self.blocks[it]);
+                self.f.jump(self.b, j, (), target, None);
+            }
+            _ => todo!("{:?}", terminator),
         }
     }
     
-    fn emit_value(&mut self, value: &Rvalue) -> Ferb::Ref {
+    fn emit_value(&mut self, value: &Rvalue<'tcx>) -> Ferb::Ref {
         match value {
-            Rvalue::Use(operand) => match operand {
-                Operand::Constant(it) => {
-                    match it.const_ {
-                        Const::Val(it, _ty) => {
-                            match it {
-                                ConstValue::Scalar(it) => {
-                                    match it {
-                                        Scalar::Int(it) => {
-                                            let it = it.to_u32() as i64;
-                                            return self.f.con(Ferb::Id::None, it);
-                                        }
-                                        _ => todo!("{:?}", value),
-                                        
-                                    }
-                                }
-                                _ => todo!("{:?}", value),
-                                
-                            }
-                        }
-                        _ => todo!("{:?}", value),
-                    }
-                },
-                _ => todo!("{:?}", value),
-            },
+            Rvalue::Use(operand) => self.emit_operand(operand),
             _ => todo!("{:?}", value),
         }
+    }
+    
+    fn emit_operand(&mut self, operand: &Operand<'tcx>) -> Ferb::Ref {
+        match operand {
+            Operand::Constant(it) => {
+                let (val, ty) = self.finish_const(it);
+                match val {
+                    ConstValue::Scalar(it) => {
+                        match it {
+                            Scalar::Int(it) => {
+                                let it = it.to_u32() as i64;
+                                return self.f.con(Ferb::Id::None, it);
+                            }
+                            Scalar::Ptr(p, _) => {
+                                let (p, off) = p.prov_and_relative_offset();
+                                let p = self.tcx.global_alloc(p.alloc_id());
+                                assert_eq!(off.bytes(), 0, "TODO: offset ptr");
+                                match p {
+                                    GlobalAlloc::Memory(it) => {
+                                        let it = it.inner();
+                                        let bytes = it.get_bytes_unchecked(alloc_range(Size::from_bytes(0), it.size()));
+                                        assert!(it.mutability.is_not(), "TODO: need to deduplicate them so you get the same pointer");
+                                        let id = self.m.anon();
+                                        self.m.data(Ferb::Data {
+                                            id,
+                                            segment: Ferb::Seg::ConstantData,
+                                            template: Ferb::Template::Bytes(bytes),
+                                            rel: vec![],
+                                        });
+                                        return self.f.con(id, 0);
+                                    }
+                                    _ => todo!("{:?} {:?}", p, ty),
+                                }
+                            }
+                        }
+                    }
+                    ConstValue::ZeroSized => {
+                        // const known function gets here. the value is stored in the type field. 
+                        match ty.kind() {
+                            &TyKind::FnDef(def, args) => {
+                                let span = self.tcx.def_span(def);
+                                let mono = TypingEnv::fully_monomorphized();
+                                let instance = Instance::expect_resolve(self.tcx, mono, def, args, span);
+                                let id = self.m.intern(self.tcx.symbol_name(instance).name);
+                                return self.f.con(id, 0);
+                            },
+                            _ => todo!("zst {:?}", ty)
+                        }
+                    }
+                    _ => todo!("{:?}", operand),
+                }
+            }
+            _ => todo!("{:?}", operand),
+        }
+    }
+    
+    // gets rid of ::Unevaluated
+    fn finish_const(&mut self, it: &ConstOperand<'tcx>) -> (ConstValue, rustc_middle::ty::Ty<'tcx>) {
+        let mono = TypingEnv::fully_monomorphized();
+        let b = EarlyBinder::bind(it.const_);
+        let v = self.instance.instantiate_mir_and_normalize_erasing_regions(self.tcx, mono, b);
+        let val = v.eval(self.tcx, mono, it.span).unwrap();
+        (val, v.ty())
     }
 }
