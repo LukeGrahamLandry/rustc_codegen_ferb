@@ -326,7 +326,6 @@ pub enum J {
     jmp,
     jnz,
     hlt = 31,
-    switch,
 }
 
 #[repr(u8)]
@@ -427,4 +426,6 @@ impl<T> Debug for Idx<T> {
 
 impl Ref {
     pub const Null: Ref = Ref(0);
+    pub const Undef: Ref = pack_ref(RefKind::RCon, 0);
+    pub const Zero: Ref = pack_ref(RefKind::RCon, 1);
 }

@@ -8,11 +8,26 @@ pub extern "C" fn main() -> usize {
     #[allow(unused_assignments)]
     let mut s = "nope";
     s = " World\0";
-    let n = 35_usize.wrapping_add(s.len());
+    let mut n = important_value(30, 5).wrapping_add(s.len());
     let s = s.as_ptr();
-    unsafe { puts(S); };
-    unsafe { puts(s); };
-    return n;
+    let a = match n.wrapping_sub(41) {
+        0 => 41,
+        1 => 42,
+        2 => 40,
+        _ => 39,
+    };
+    if n <= a {
+        unsafe { puts(S); };
+    }
+    while n >= 42 {
+        unsafe { puts(s); };
+        n = n.wrapping_sub(1);
+    }
+    return n.wrapping_sub(41);
+}
+
+fn important_value(a: usize, b: usize) -> usize {
+    a.wrapping_add(b)
 }
 
 unsafe extern "C" {

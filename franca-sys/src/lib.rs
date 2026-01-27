@@ -18,6 +18,7 @@ pub struct CompileCmd<'a> {
     pub frc: Slice<'a>,
     pub out: Slice<'a>,  // lie!
     pub name: Slice<'a>,
+    pub logging: Slice<'a>,    
     pub p: u64,
     pub m: u64,
     pub jit: u8,

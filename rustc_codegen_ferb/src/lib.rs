@@ -83,7 +83,8 @@ impl CodegenBackend for FerbCodegenBackend {
             panic!("TODO: OutFileName")
         };
         
-        let obj = ferb::compile_aot(&worker.m.finish());
+        let logging = &*std::env::var("FRANCA_DASH_d").unwrap_or_else(|_| String::new());
+        let obj = unsafe { ferb::compile_aot(&worker.m.finish(), logging) };
         std::fs::write(&output_file, obj).unwrap();
 
         let result = CompiledModule {
@@ -114,7 +115,7 @@ impl CodegenBackend for FerbCodegenBackend {
     fn target_config(&self, sess: &Session) -> TargetConfig {
         let f = match sess.target.arch {
             Arch::AArch64 => vec![sym::neon],
-            Arch::X86_64 => vec![Symbol::intern("x87")],
+            Arch::X86_64 => vec![Symbol::intern("x87"), sym::sse2],
             _ => vec![],
         };
 

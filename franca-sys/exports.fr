@@ -6,11 +6,6 @@ Globals :: @struct {
 };
 globals :: @static(Globals);
 
-
-
-
-
-
 host_os :: {
     // when compiled by build.rs, it always passes -arch,-os. 
     // this is the host franca-sys will run on (not the host build.rs is running on)
@@ -49,6 +44,7 @@ CompileCmd :: @struct {
     frc: []u8;
     out: []u8;
     name: Str;
+    logging: Str;
     p: rawptr;
     m: *Qbe.Module;
     jit: u8;
@@ -63,7 +59,7 @@ fn compile_one(_: *Globals, arg: *CompileCmd) void #export = {
             os = query_current_os(),  
             arch = query_current_arch(), 
         ));
-        m.set_debug_types("PdtR", true);
+        m.set_debug_types(arg.logging, true);
         H :: *Qbe.Incremental.Header;
         ::Result(H, Str);
         header: H = or check(arg.frc) { e |

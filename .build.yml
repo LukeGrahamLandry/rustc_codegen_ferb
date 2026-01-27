@@ -5,8 +5,9 @@ sources:
 packages:
 - "rustup"
 tasks:
-- test: |
+- franca: |
     cd franca
     ./boot/strap.sh -no-test
-    cd ../rustc_codegen_ferb
-    ./test.sh
+- test: |
+    cd rustc_codegen_ferb
+    ../franca/target/f.out tests/main.fr

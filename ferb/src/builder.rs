@@ -358,6 +358,7 @@ impl Func {
     pub fn jump(&mut self, b: BlkId, kind: J, arg: impl Reflike, s1: Option<BlkId>, s2: Option<BlkId>) {
         let arg = arg.r(self);
         let b = &mut self.blocks[b.0 as usize];
+        debug_assert_eq!(b.jmp.kind, J::xxx);
         b.jmp = BlkJmp { kind, arg, };
         b.s = [s1, s2];
     }

@@ -20,6 +20,7 @@ struct Emit<'f, 'tcx> {
 
 pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Module {
     let mut m = Ferb::Module::new();
+    // TODO: i inline better if they're sorted in callgraph order (def before use)
     let items = cgu.items_in_deterministic_order(tcx);
     for (it, _data) in items {
         match it {
@@ -93,6 +94,27 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 let target = target.map(|it| self.blocks[it]);
                 self.f.jump(self.b, j, (), target, None);
             }
+            TerminatorKind::SwitchInt { discr, targets } => {
+                let discr = self.emit_operand(discr);
+                if let Some((val, a, b)) = targets.as_static_if() {
+                    if val == 0 {
+                        // TODO: don't assume Kw
+                        self.f.jump(self.b, J::jnz, discr, Some(self.blocks[b]), Some(self.blocks[a]));
+                        return;
+                    }
+                }
+                // TODO: don't assume Kl
+                // :SLOW
+                let mut next = self.f.blk();
+                for (&val, &dest) in targets.all_values().iter().zip(targets.all_targets()) {
+                    let cond = self.f.tmp();
+                    self.f.emit(self.b, O::ceql, Kl, cond, discr, val.0 as u64);
+                    self.f.jump(self.b, J::jnz, cond, Some(self.blocks[dest]), Some(next));
+                    self.b = next;
+                    next = self.f.blk();
+                }
+                self.f.jump(self.b, J::jmp, (), Some(self.blocks[targets.otherwise()]), None);
+            }
             _ => todo!("{:?}", terminator),
         }
     }
@@ -127,10 +149,12 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 }
             }
             Rvalue::BinaryOp(op, box(lhs, rhs)) => {
-                assert_eq!(*op, BinOp::Add);
                 let (lhs, rhs) = (self.emit_operand(lhs), self.emit_operand(rhs));
+                // TODO: don't assume u64
+                let op = choose_op(*op, false);
                 let r = self.f.tmp();
-                self.f.emit(self.b, O::add, Kl, r, lhs, rhs);
+                self.f.emit(self.b, op, Kl, r, lhs, rhs);
+                // TODO: mask if explicitly wrapping
                 r
             }
             _ => todo!("{:?}", value),
@@ -236,5 +260,29 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         let v = self.instance.instantiate_mir_and_normalize_erasing_regions(self.tcx, mono, b);
         let val = v.eval(self.tcx, mono, it.span).unwrap();
         (val, v.ty())
+    }
+}
+
+fn choose_op(op: BinOp, signed: bool) -> Ferb::O {
+    use Ferb::O::*;
+    use BinOp::*;
+    match op {
+        Add | AddUnchecked => add,
+        Sub | SubUnchecked => sub,
+        Mul | MulUnchecked => mul,
+        Div => if signed { div } else { udiv },
+        Rem => if signed { rem } else { urem },
+        BitXor => xor,
+        BitAnd => and,
+        BitOr => or,
+        Shl | ShlUnchecked => shl,
+        Shr | ShrUnchecked => if signed { sar } else { shr },
+        Eq => ceql,
+        Lt => if signed { csltl } else { cultl },
+        Le => if signed { cslel } else { culel },
+        Ne => cnel,
+        Ge => if signed { csgel } else { cugel },
+        Gt => if signed { csgtl } else { cugtl },
+        _ => todo!("{:?}", op),
     }
 }

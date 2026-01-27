@@ -1,0 +1,39 @@
+
+// run with FRANCA_DASH_d="Pdt" to see the ir
+main :: fn() void = {
+    suffix := @match(query_current_os()) {
+        fn macos() => "dylib";
+        fn linux() => "so";
+    };
+    
+    // TODO: RUSTFLAGS="--remap-path-prefix $HOME=~ --remap-path-prefix $(pwd)=."
+    sh(@slice("cargo", "build"));
+    sh(@slice("cargo", "test", "--tests", "--package", "ferb"));
+    
+    // opt-level=3 enables inlining (and presumably other stuff), gives me simpler ir to deal with. 
+    opt_levels := @slice(3, 0);
+    for opt_levels { opt_level |
+        // makes it not create rustc-ice-DATE.txt when i crash... which happens a lot :(
+        // TODO: RUSTC_ICE="0"
+        
+        args := @slice(
+            "rustc",
+            "tests/hello.rs",
+            "-C", @tfmt("opt-level=%", opt_level),
+            "-Z", @tfmt("codegen-backend=target/debug/librustc_codegen_ferb.%", suffix),
+            "-C", "panic=abort",
+            "-lc",
+            "-Z", "dump-mir= & PreCodegen",
+            "-Z", "dump-mir-dir=target/mir_dump",
+            "--out-dir", "target",
+        );
+        sh(args);
+        ok, out, err := exec_and_catch("./target/hello", empty(), temp()); 
+        @assert(ok, "exit non-zero %%", out.items(), err.items());
+        @assert_eq(out.items(), "Hello\n World\n", "%", err.items());
+    };
+}
+
+#use("@/lib/sys/subprocess.fr");
+#use("@/lib/sys/fs.fr");
+sh :: import("@/examples/testing.fr").sh;

@@ -24,6 +24,7 @@ fn jit_add() {
             frc: Slice::from(&bytes[0..]),
             out: Slice::from("".as_bytes()),
             name: Slice::from(name.as_bytes()),
+            logging: Slice::from("".as_bytes()),
             p: 0,
             m: 0,
             jit: 1,
