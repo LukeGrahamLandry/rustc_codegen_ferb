@@ -1,10 +1,12 @@
 use rustc_const_eval::interpret::{AllocId, GlobalAlloc, Scalar, alloc_range};
+use rustc_hir::def_id::DefId;
 use rustc_index::{Idx, IndexVec};
-use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, Operand, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}}, ty::{EarlyBinder, Instance, Ty, TyCtxt, TyKind, TypingEnv}};
+use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}}, ty::{EarlyBinder, Instance, Ty, TyCtxt, TyKind, TypingEnv, layout::{self, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers}}};
 use ferb::builder as Ferb;
 use Ferb::Cls::*;
 use Ferb::{J, O};
-use rustc_abi::Size;
+use rustc_abi::{FieldIdx, FieldsShape, HasDataLayout, Size};
+use rustc_span::Span;
 
 struct Emit<'f, 'tcx> {
     tcx: TyCtxt<'tcx>,
@@ -64,9 +66,8 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         for stmt in &blk.statements {
             match &stmt.kind {
                 StatementKind::Assign(box (place, value)) => {
-                    let dest = self.locals[place.local];
                     let r = self.emit_value(value);
-                    self.f.emit(self.b, O::copy, Kl, dest, r, ());
+                    self.store_place(place, r);
                 },
                 StatementKind::Nop => (),
                 StatementKind::StorageLive(_) => (),
@@ -122,7 +123,11 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     fn emit_value(&mut self, value: &Rvalue<'tcx>) -> Ferb::Ref {
         match value {
             Rvalue::Use(operand) => self.emit_operand(operand),
-            Rvalue::RawPtr(_, place) => self.locals[place.local],  // TODO: maybe it needs to be an alloca
+            Rvalue::RawPtr(_, place) => {
+                assert!(place.projection.len() == 1 && place.projection[0].kind() == ProjectionElem::Deref);
+                let local = place.local;
+                self.locals[local]
+            }
             Rvalue::Cast(kind, value, dest_ty) => {
                 let src = self.emit_operand(value);
                 let src_ty = value.ty(&self.mir.local_decls, self.tcx);
@@ -157,14 +162,89 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 // TODO: mask if explicitly wrapping
                 r
             }
+            Rvalue::Aggregate(kind, fields) => {
+                use rustc_middle::mir::AggregateKind::*;
+                match **kind {
+                    Adt(def, varient, args, _, active) => {
+                        assert!(varient.as_u32() == 0, "TODO: tagged");
+                        assert!(active.is_none(), "TODO: union");
+                        assert!(args.len() == 0, "TODO: generic");
+                        let ty = self.finish_type(def);
+                        let layout = self.layout_of(ty);
+                        // TODO: pass in the place instead
+                        let base = self.alloca(layout.size.bytes_usize() as i64);
+                        for field in layout.fields.index_by_increasing_offset() {
+                            let value = &fields[FieldIdx::new(field)];
+                            let value = self.emit_operand(value);
+                            let offset = layout.fields.offset(field);
+                            let r = self.offset(base, offset);
+                            self.f.emit(self.b, O::storel, Kw, (), value, r);
+                        }
+                        base
+                    }
+                    _ => todo!("{:?}", value),
+                }
+            }
             _ => todo!("{:?}", value),
         }
     }
     
+    fn offset(&mut self, r: Ferb::Ref, off: Size) -> Ferb::Ref {
+        if off.bytes() == 0 { return r; }
+        let r2 = self.f.tmp();
+        self.f.emit(self.b, O::add, Kl, r2, r, off.bytes());
+        r2
+    }
+    
+    fn addr_place(&mut self, place: &Place<'tcx>) -> Ferb::Ref {
+        let ty = self.mir.local_decls[place.local].ty;
+        let layout = self.layout_of(ty);
+        if let Some(it) = place.as_local() {
+            return self.locals[it];
+        }
+        assert!(place.projection.len() == 1);
+        let it = &place.projection[0];
+        use ProjectionElem::*;
+        match it.kind() {
+            Deref => todo!(),
+            Field(field_idx, _) => {
+                use FieldsShape::*;
+                let offsets = match &layout.fields {
+                    Arbitrary { offsets, .. } => offsets,
+                    _ => todo!("{:?}", place),
+                };
+                return self.offset(self.locals[place.local], offsets[field_idx]);
+            }
+            _ => todo!("{:?}", place),
+        }
+    }
+    
+    // when place.as_local, addr_place could still be a stack address 
+    // (for wide pointers) which is convoluted. should make it more consistant. 
+    // have something like compiler/emit_ir.fr/Placement that i can pass around. 
+    fn store_place(&mut self, place: &Place<'tcx>, r: Ferb::Ref) {
+        let base = self.addr_place(place);
+        if place.as_local().is_some() {
+            self.f.emit(self.b, O::copy, Kl, base, r, ());
+            return;
+        }
+        self.f.emit(self.b, O::storel, Kw, (), r, base);
+    }
+    
+    fn load_place(&mut self, place: &Place<'tcx>) -> Ferb::Ref {
+        let base = self.addr_place(place);
+        if place.as_local().is_some() {
+            return base;
+        }
+        let r = self.f.tmp();
+        self.f.emit(self.b, O::load, Kl, r, base, ());
+        r
+    }
+    
     fn emit_operand(&mut self, operand: &Operand<'tcx>) -> Ferb::Ref {
         match operand {
-            Operand::Copy(place) => self.locals[place.local],
-            Operand::Move(place) => self.locals[place.local],
+            Operand::Copy(place) => self.load_place(place),
+            Operand::Move(place) => self.load_place(place),
             Operand::Constant(it) => {
                 let (val, ty) = self.finish_const(it);
                 match val {
@@ -207,20 +287,15 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     // TODO: dumb because i know im slow at promoting if you keep recalculating the address for the second slot.
     fn create_pair(&mut self, a: impl Ferb::Reflike, b: impl Ferb::Reflike) -> Ferb::Ref {
         let r = self.alloca(16);
-        let r2 = self.f.tmp();
-        self.f.emit(self.b, O::add, Kl, r2, r, 8);
+        let r2 = self.offset(r, Size::from_bytes(8));
         self.f.emit(self.b, O::storel, Kw, (), a, r);
         self.f.emit(self.b, O::storel, Kw, (), b, r2);
         r
     }
     
     fn get_pair_slot(&mut self, addr: impl Ferb::Reflike, first: bool) -> Ferb::Ref {
-        let mut addr = addr.r(self.f);
-        if !first {
-            let r = self.f.tmp();
-            self.f.emit(self.b, O::add, Kl, r, addr, 8);
-            addr = r;
-        }
+        let addr = addr.r(self.f);
+        let addr = self.offset(addr, Size::from_bytes(if first { 0 } else { 8 }));
         let r = self.f.tmp();
         self.f.emit(self.b, O::load, Kl, r, addr, ());
         r
@@ -261,6 +336,12 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         let val = v.eval(self.tcx, mono, it.span).unwrap();
         (val, v.ty())
     }
+    
+    fn finish_type(&mut self, def: DefId) -> Ty<'tcx> {
+        let ty = self.tcx.type_of(def);
+        let mono = TypingEnv::fully_monomorphized();
+        self.instance.instantiate_mir_and_normalize_erasing_regions(self.tcx, mono, ty)
+    }
 }
 
 fn choose_op(op: BinOp, signed: bool) -> Ferb::O {
@@ -286,3 +367,28 @@ fn choose_op(op: BinOp, signed: bool) -> Ferb::O {
         _ => todo!("{:?}", op),
     }
 }
+
+impl<'tcx> HasDataLayout for Emit<'_, 'tcx> {
+    fn data_layout(&self) -> &rustc_abi::TargetDataLayout {
+        &self.tcx.data_layout
+    }
+}
+
+impl<'tcx> HasTypingEnv<'tcx> for Emit<'_, 'tcx> {
+    fn typing_env(&self) -> TypingEnv<'tcx> {
+        TypingEnv::fully_monomorphized()
+    }
+}
+impl<'tcx> HasTyCtxt<'tcx> for Emit<'_, 'tcx> {
+    fn tcx(&self) -> TyCtxt<'tcx> {
+        self.tcx
+    }
+}
+impl<'tcx> LayoutOfHelpers<'tcx> for Emit<'_, 'tcx> {
+    type LayoutOfResult = layout::TyAndLayout<'tcx>;
+
+    fn handle_layout_err(&self, _: layout::LayoutError<'tcx>, _: Span, _: Ty<'tcx>) -> <Self::LayoutOfResult as layout::MaybeResult<layout::TyAndLayout<'tcx>>>::Error {
+        todo!()
+    }
+}
+

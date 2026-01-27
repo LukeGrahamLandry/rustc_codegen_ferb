@@ -16,14 +16,21 @@ pub extern "C" fn main() -> usize {
         2 => 40,
         _ => 39,
     };
-    if n <= a {
+    let mut t = Thing { a, b: 42, };
+    if n <= t.a {
         unsafe { puts(S); };
     }
-    while n >= 42 {
+    while n >= t.b {
         unsafe { puts(s); };
         n = n.wrapping_sub(1);
+        t.a = t.a.wrapping_sub(1);
     }
-    return n.wrapping_sub(41);
+    return n.wrapping_sub(t.a);
+}
+
+struct Thing {
+    a: usize,
+    b: usize,
 }
 
 fn important_value(a: usize, b: usize) -> usize {
