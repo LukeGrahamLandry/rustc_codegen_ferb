@@ -22,7 +22,7 @@ pub fn main() {
                 "-keep-names",
                 "-arch", arch, "-os", os,
                 "-c", 
-                // TODO: -unsafe if --release (var(OPT_LEVEL))
+                if var("OPT_LEVEL") == "0" { "-safe" } else { "-unsafe" }
         ])
         .output()
         .expect("run franca");

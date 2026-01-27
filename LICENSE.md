@@ -1,0 +1,1 @@
+https://git.sr.ht/~lukegrahamlandry/franca/tree/main/item/LICENSE.md

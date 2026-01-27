@@ -412,6 +412,16 @@ impl Reflike for i64 {
         f.con(Id::None, self)
     }
 }
+impl Reflike for u64 {
+    fn r(self, f: &mut Func) -> Ref {
+        i64::from_ne_bytes(self.to_ne_bytes()).r(f)
+    }
+}
+impl Reflike for i32 {
+    fn r(self, f: &mut Func) -> Ref {
+        (self as i64).r(f)
+    }
+}
 impl Reflike for () {
     fn r(self, _: &mut Func) -> Ref {
         Ref::Null

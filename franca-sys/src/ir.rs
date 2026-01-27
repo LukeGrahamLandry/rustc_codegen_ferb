@@ -353,7 +353,8 @@ pub const fn pack_ref(kind: RefKind, i: u32) -> Ref {
 
 // ret_cls: Cls / 4 / 5
 pub const fn pack_fnc_flags(var_arg: bool, ret_cls: u32) -> u32 {
-    (ret_cls << 7) | ((var_arg as u32) << 1)
+    let run_early_passes = 1 << 10;
+    (ret_cls << 7) | ((var_arg as u32) << 1) | run_early_passes
 }
 
 pub const fn pack_typ_flags(dark: bool, union: bool) -> u8 {

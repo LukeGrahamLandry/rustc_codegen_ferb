@@ -3,10 +3,16 @@
 use core::panic::PanicInfo;
 
 #[no_mangle]
-pub extern "C" fn main() -> i32 {
+pub extern "C" fn main() -> usize {
     const S: *const u8 = "Hello\0".as_ptr();
+    #[allow(unused_assignments)]
+    let mut s = "nope";
+    s = " World\0";
+    let n = 35_usize.wrapping_add(s.len());
+    let s = s.as_ptr();
     unsafe { puts(S); };
-    return 42;
+    unsafe { puts(s); };
+    return n;
 }
 
 unsafe extern "C" {

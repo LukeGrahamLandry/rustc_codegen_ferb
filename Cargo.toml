@@ -5,3 +5,9 @@ members = [
     "franca-sys",
     "rustc_codegen_ferb",
 ]
+
+# reduce infinite bloat of target folder on macos when repeatedly running 
+# `touch franca-sys/exports.fr && ./test.sh` 
+# while keeping panic locations in my own code. 
+[profile.dev]
+debug = "line-tables-only"  
