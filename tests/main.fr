@@ -30,7 +30,7 @@ main :: fn() void = {
         sh(args);
         ok, out, err := exec_and_catch("./target/hello", empty(), temp()); 
         @assert(ok, "exit non-zero %%", out.items(), err.items());
-        @assert_eq(out.items(), "Hello\n World\n", "%", err.items());
+        @assert_eq(out.items(), "Hello\n World 42\n", "%", err.items());
     };
 }
 

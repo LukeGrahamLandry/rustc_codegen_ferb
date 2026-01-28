@@ -22,7 +22,7 @@ pub extern "C" fn main() -> usize {
         unsafe { puts(S); };
     }
     while n >= t.b {
-        unsafe { puts(s); };
+        unsafe { printf("%s %ld\n\0".as_ptr(), s, n) };
         n = n.wrapping_sub(1);
         t.a = t.a.wrapping_sub(1);
     }
@@ -62,6 +62,7 @@ fn important_value(a: usize, b: usize) -> usize {
 
 unsafe extern "C" {
     fn puts(s: *const u8) -> i32;
+    fn printf(fmt: *const u8, ...) -> i32;
 }
 
 #[panic_handler]

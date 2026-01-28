@@ -112,10 +112,19 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             }
             TerminatorKind::Call { func, args, destination, target, .. } => {
                 let callee = self.emit_operand(func);
-                
+                let sig = func.ty(self.mir, self.tcx).fn_sig(self.tcx);
+                let arg_count = sig.inputs().skip_binder().len();
                 let args = args.iter().map(|arg| self.emit_operand(&arg.node)).collect::<Vec<_>>();
-                for arg in args {
+                for (i, arg) in args.iter().enumerate() {
+                    if i == arg_count {
+                        assert!(sig.c_variadic());
+                        self.f.emit(self.b, O::argv, Kw, (), (), ());
+                    }
                     self.f.emit(self.b, O::arg, Kl, (), arg.r, ());
+                }
+                if sig.c_variadic() && args.len() == arg_count {
+                    // wasm cares if variadic even if none passed
+                    self.f.emit(self.b, O::argv, Kw, (), (), ());
                 }
                 let r = self.tmp();
                 self.emit(O::call, Kl, r, callee, Val::R);
