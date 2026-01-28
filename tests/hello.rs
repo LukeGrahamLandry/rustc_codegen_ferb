@@ -19,10 +19,17 @@ pub extern "C" fn main() -> usize {
     };
     let value = 1f64;
     let mut t = Thing { a, b: 42, c: value + 1f64};
+    n = unsafe {
+        static mut BAR: Thing = Thing { a: 123, b: 0, c: 0.0 };
+        BAR.a = n;
+        BAR.a
+    };
     if n <= t.a {
         unsafe { puts(S); };
     }
-    let x = 4;
+    let mut x = 5;
+    let xx = &mut x;
+    *xx = 4;
     while n >= t.b {
         unsafe { printf("%s %d%.0f\n\0".as_ptr(), s, x, t.c) };
         n = n.wrapping_sub(1);

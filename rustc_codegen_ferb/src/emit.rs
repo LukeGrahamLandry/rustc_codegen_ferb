@@ -1,6 +1,6 @@
-use rustc_const_eval::interpret::{AllocId, GlobalAlloc, Scalar, alloc_range};
+use rustc_const_eval::interpret::{AllocId, ConstAllocation, GlobalAlloc, Scalar, alloc_range};
 use rustc_hir::def_id::DefId;
-use rustc_index::{Idx, IndexVec};
+use rustc_index::{Idx, IndexVec, bit_set::MixedBitSet};
 use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}}, ty::{EarlyBinder, GenericArgsRef, Instance, Ty, TyCtxt, TyKind, TypingEnv, layout::{self, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers}}};
 use ferb::builder as Ferb;
 use Ferb::Cls::*;
@@ -67,7 +67,8 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
                     emit.emit(O::par, k, r, Val::R, Val::R);
                     emit.locals[local] = r;
                 }
-                
+
+                emit.allocate_locals();
                 emit.f.jump(emit.b, J::jmp, (), Some(emit.blocks[BasicBlock::new(0)]), None);
                 for (bid, blk) in mir.basic_blocks.iter_enumerated() {
                     emit.b = emit.blocks[bid]; 
@@ -75,7 +76,17 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
                 }
                 m.func(f);
             },
-            MonoItem::Static(_) => todo!(),
+            MonoItem::Static(def) => {
+                let id = def_symbol(&mut m, tcx, def, None);
+                let p = tcx.eval_static_initializer(def).unwrap();
+                let (bytes, segment) = get_all_bytes(p);
+                m.data(Ferb::Data {
+                    id,
+                    segment,
+                    template: Ferb::Template::Bytes(bytes),
+                    rel: vec![],
+                });
+            },
             MonoItem::GlobalAsm(_) => todo!(),
         } 
     }
@@ -84,6 +95,39 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
 }
 
 impl<'f, 'tcx> Emit<'f, 'tcx> {
+    fn allocate_locals(&mut self) {
+        let mut needs_alloca = MixedBitSet::<Local>::new_empty(self.mir.local_decls.len());
+        for b in self.mir.basic_blocks.iter() {
+            for it in &b.statements {
+                // TODO: any other uses of places that take address?
+                if let StatementKind::Assign(box (_, value)) = &it.kind {
+                    if let Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) = value {
+                        needs_alloca.insert(place.local);
+                    }
+                }
+            }
+        }
+        for (local, it) in self.mir.local_decls.iter_enumerated() {
+            let (k, kind) = self.cls(it.ty);
+            let size = self.layout_of(it.ty).size.bytes() as i64;
+            let is_arg = self.locals[local].kind != ValKind::Undef;
+            let take_ref = needs_alloca.contains(local);
+            if is_arg {
+                assert!(kind != ValKind::Scalar || !take_ref, "TODO: &arg");
+                continue;
+            }
+            self.locals[local] = match kind {
+                ValKind::Scalar => if needs_alloca.contains(local) {
+                    self.alloca(size, ValKind::Memory)
+                } else {
+                    self.tmp(k)
+                }
+                ValKind::Pair | ValKind::Memory => self.alloca(size, kind),
+                ValKind::Undef => todo!(),
+            }
+        }
+    }
+    
     fn emit_block(&mut self, blk: &BasicBlockData<'tcx>) {
         for stmt in &blk.statements {
             match &stmt.kind {
@@ -157,6 +201,13 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 self.f.jump(self.b, J::jmp, (), Some(self.blocks[targets.otherwise()]), None);
             }
             TerminatorKind::Unreachable => self.f.jump(self.b, J::hlt, (), None, None),
+            TerminatorKind::Assert { cond, expected, target, .. } => {
+                let cond = self.emit_operand(cond);
+                let dest = [self.f.blk(), self.blocks[*target]];
+                // TODO: also print the msg.
+                self.f.jump(dest[0], J::hlt, (), None, None);
+                self.f.jump(self.b, J::jnz, cond.r, Some(dest[*expected as usize]), Some(dest[!*expected as usize]));
+            }
             _ => todo!("{:?}", terminator),
         }
     }
@@ -167,7 +218,13 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             Rvalue::RawPtr(_, place) => {
                 assert!(place.projection.len() == 1 && place.projection[0].kind() == ProjectionElem::Deref);
                 let local = place.local;
+                assert!(self.locals[local].kind != ValKind::Scalar, "{:?}", value);
                 self.locals[local]
+            }
+            Rvalue::Ref(_, _, place) => {
+                let local = place.local;
+                assert!(self.locals[local].kind != ValKind::Scalar, "{:?}", value);
+                self.addr_place(place)
             }
             Rvalue::Cast(kind, value, dest_ty) => {
                 let src = self.emit_operand(value);
@@ -175,12 +232,12 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 match kind {
                     CastKind::Transmute => src,
                     CastKind::PtrToPtr => {
-                        // TODO: must be a less painful way to check if its just getting the first slot out of a wide pointer. 
-                        let str_to_ptr = src_ty.is_any_ptr() && src_ty.builtin_deref(true).unwrap().is_str() && dest_ty.is_any_ptr();
-                        if str_to_ptr {
+                        assert!(src_ty.is_any_ptr() && dest_ty.is_any_ptr());
+                        if is_wide(src_ty) && !is_wide(*dest_ty) {
                             return self.get_pair_slot(src, true);
                         }
-                        todo!("PtrToPtr {:?} {:?}", src_ty, dest_ty);
+                        assert!(is_wide(src_ty) == is_wide(*dest_ty));
+                        src
                     }
                     CastKind::IntToInt => {
                         assert!(dest_ty.primitive_size(self.tcx) == src_ty.primitive_size(self.tcx));
@@ -195,6 +252,13 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         let p = self.emit_operand(value);
                         self.get_pair_slot(p, false)
                     }
+                    UnOp::Not => {
+                        let r = self.emit_operand(value);
+                        let r2 = self.tmp(r.k);
+                        let ones = self.r(-1i64, r.k);
+                        self.emit(O::xor, r.k, r2, r, ones);
+                        r2
+                    }
                     _ => todo!("{:?} {:?}", op, value)
                 }
             }
@@ -208,6 +272,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 let op = choose_op(*op, out_ty.is_signed());
                 let k = self.cls(out_ty).0;
                 let r = self.tmp(k);
+                assert!(lhs.kind == ValKind::Scalar && rhs.kind == ValKind::Scalar);
                 self.emit(op, k, r, lhs, rhs);
                 // TODO: mask if explicitly wrapping
                 r
@@ -269,7 +334,6 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 }
                 todo!("discriminant {:?}", place)
             }
-            Rvalue::Ref(_, _, place) => self.addr_place(place),
             _ => todo!("{:?}", value),
         }
     }
@@ -293,12 +357,16 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         }
         let mut base = self.locals[place.local];
         let mut parent_ty = self.mir.local_decls[place.local].ty;
-        assert!(matches!(base.kind, ValKind::Memory));
         for it in place.projection.iter() {
             use ProjectionElem::*;
             match it.kind() {
-                Deref => (),  // TODO: this can't be right
+                Deref => {
+                    assert!(base.kind == ValKind::Scalar);
+                    base.kind = ValKind::Memory;
+                    return base;  
+                }
                 Field(field_idx, ()) => {
+                    assert!(matches!(base.kind, ValKind::Memory));
                     use FieldsShape::*;
                     let layout = self.layout_of(parent_ty);
                     let offsets = match &layout.fields {
@@ -309,6 +377,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     base = self.offset(base, offsets[field_idx]);
                 }
                 Downcast(_, varient) => {
+                    assert!(matches!(base.kind, ValKind::Memory));
                     let layout = self.layout_of(parent_ty);
                     let layout = layout.for_variant(self, varient);
                     let first = layout.layout.fields.index_by_increasing_offset().next().unwrap();
@@ -321,24 +390,21 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         base
     }
     
-    fn store_place(&mut self, place: &Place<'tcx>, mut r: Val) {
-        if let Some(local) = place.as_local() {
-            if self.locals[local].kind == ValKind::Undef {
-                if r.kind == ValKind::Scalar {
-                    let v = self.tmp(r.k);
-                    self.emit(O::copy, v.k, v, r, Val::R);
-                    r = v;
-                }
-                self.locals[local] = r;
-                return;
-            }
-        }
+    fn store_place(&mut self, place: &Place<'tcx>, r: Val) {
         let base = self.addr_place(place);
         match base.kind {
             ValKind::Scalar | ValKind::Pair => self.emit(O::copy, r.k, base, r, Val::R),
             ValKind::Memory => {
-                assert!(r.kind == ValKind::Scalar);
-                self.emit(Ferb::store(r.k), Kw, Val::R, r, base);
+                match r.kind {
+                    ValKind::Scalar => self.emit(Ferb::store(r.k), Kw, Val::R, r, base),
+                    ValKind::Pair => todo!(),
+                    ValKind::Memory => {
+                        let ty = place.ty(self.mir, self.tcx).ty;
+                        let size = self.layout_of(ty).size.bytes_usize();
+                        self.f.blit(self.b, base.r, r.r, size);
+                    }
+                    _ => todo!(),
+                }
             }
             ValKind::Undef => todo!(),
         };
@@ -360,7 +426,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 if ty.is_adt() { return base; }
                 self.emit(O::load, k, r, base, Val::R);
             }
-            ValKind::Undef => todo!(),
+            ValKind::Undef => todo!("{:?}", place),
         }
         r
     }
@@ -393,10 +459,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         // const known function gets here. the value is stored in the type field. 
                         match ty.kind() {
                             &TyKind::FnDef(def, args) => {
-                                let span = self.tcx.def_span(def);
-                                let mono = TypingEnv::fully_monomorphized();
-                                let instance = Instance::expect_resolve(self.tcx, mono, def, args, span);
-                                let id = self.m.intern(self.tcx.symbol_name(instance).name);
+                                let id = def_symbol(self.m, self.tcx, def, Some(args));
                                 return self.r(id, Kl);
                             },
                             _ => todo!("zst {:?}", ty)
@@ -436,16 +499,19 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         assert_eq!(off.bytes(), 0, "TODO: offset ptr");
         match p {
             GlobalAlloc::Memory(it) => {
-                let it = it.inner();
-                let bytes = it.get_bytes_unchecked(alloc_range(Size::from_bytes(0), it.size()));
-                assert!(it.mutability.is_not(), "TODO: need to deduplicate them so you get the same pointer");
+                let (bytes, segment) = get_all_bytes(it);
+                assert!(segment == Ferb::Seg::ConstantData, "TODO: need to deduplicate them so you get the same pointer");
                 let id = self.m.anon();
                 self.m.data(Ferb::Data {
                     id,
-                    segment: Ferb::Seg::ConstantData,
+                    segment,
                     template: Ferb::Template::Bytes(bytes),
                     rel: vec![],
                 });
+                return self.r(id, Kl);
+            }
+            GlobalAlloc::Static(def) => {
+                let id = def_symbol(self.m, self.tcx, def, None);
                 return self.r(id, Kl);
             }
             _ => todo!("{:?} {:?}", p, ty),
@@ -463,9 +529,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             return (Kl, ValKind::Memory);
         }
         if ty.is_any_ptr() {
-            let inner = ty.builtin_deref(true).unwrap();
-            let wide = inner.is_str() || inner.is_array_slice();
-            return (Kl, if wide { ValKind::Pair } else { ValKind::Scalar });
+            return (Kl, if is_wide(ty) { ValKind::Pair } else { ValKind::Scalar });
         }
         use rustc_ast::UintTy::*;
         let k = |it| match it {
@@ -483,6 +547,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 n => todo!("f{}", n),
             },
             TyKind::FnDef(_, _) | TyKind::FnPtr(_, _) => Kl,
+            TyKind::Never => Kl,  // eh...
             _ => todo!("{:?}", ty),
         }, ValKind::Scalar)
     }
@@ -505,6 +570,35 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     pub fn emit(&mut self, o: O, k: Ferb::Cls, to: Val, a0: Val, a1: Val) {
         self.f.emit(self.b, o, k, to.r, a0.r, a1.r);
     }
+}
+
+fn def_symbol<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, def: DefId, args: Option<GenericArgsRef<'tcx>>) -> Ferb::Id<Ferb::Sym> {
+    let span = tcx.def_span(def);
+    let mono = TypingEnv::fully_monomorphized();
+    let instance = match args {
+        Some(args) => Instance::expect_resolve(tcx, mono, def, args, span),
+        None => Instance::mono(tcx, def),
+    };
+    let id = m.intern(tcx.symbol_name(instance).name);
+    id
+}
+
+fn get_all_bytes<'tcx>(it: ConstAllocation<'tcx>) -> (&'tcx [u8], Ferb::Seg) {
+    let it = it.inner();
+    assert!(it.provenance().provenances().next().is_none(), "TODO: rel");
+    let range = alloc_range(Size::from_bytes(0), it.size());
+    use rustc_ast::Mutability::*;
+    let seg = match it.mutability {
+        Not => Ferb::Seg::ConstantData,
+        Mut => Ferb::Seg::MutableData,
+    };
+    (it.get_bytes_unchecked(range), seg)
+}
+
+fn is_wide(ty: Ty) -> bool {
+    if !ty.is_any_ptr() { return false };
+    let inner = ty.builtin_deref(true).unwrap();
+    inner.is_str() || inner.is_array_slice()
 }
 
 impl Val {
