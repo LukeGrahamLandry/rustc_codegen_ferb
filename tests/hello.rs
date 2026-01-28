@@ -1,5 +1,7 @@
 #![no_std]
 #![no_main]
+#![allow(internal_features)]
+#![feature(lang_items)]
 use core::panic::PanicInfo;
 
 #[no_mangle]
@@ -46,12 +48,18 @@ pub extern "C" fn main() -> usize {
         Some(_) => 123,
         None => n,
     };
-    
-    return n.wrapping_sub(t.a);
+    let foo = (0, twice(t.a).1, "");
+    let value = n - foo.1;
+    voidcall();
+    return value;
 }
 
+fn voidcall() {}
+fn twice<T: Copy>(a: T) -> (T, T) { (a, a) }
+
 fn another(a: usize, b: Thing) -> usize {
-    let t = Thing { a, b: b.b, c: 0f64 };
+    let a = &a;
+    let t = Thing { a: *a, b: b.b, c: 0f64 };
     let t = Things { t };
     t.t.a.wrapping_add(t.t.b).wrapping_add(b.a)
 }
@@ -77,5 +85,12 @@ unsafe extern "C" {
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
+    loop {}
+}
+
+// the humble `for` loop references this if opt-level=0
+#[lang = "eh_personality"]
+pub fn rust_eh_personality() -> ! {
+    unsafe { puts("rust_eh_personality\0".as_ptr()) }; 
     loop {}
 }
