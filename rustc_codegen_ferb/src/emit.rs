@@ -4,8 +4,8 @@ use rustc_index::{Idx, IndexVec};
 use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}}, ty::{EarlyBinder, GenericArgsRef, Instance, Ty, TyCtxt, TyKind, TypingEnv, layout::{self, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers}}};
 use ferb::builder as Ferb;
 use Ferb::Cls::*;
-use Ferb::{J, O};
-use rustc_abi::{FieldIdx, FieldsShape, HasDataLayout, Primitive, Size, TagEncoding, Variants};
+use Ferb::{J, O, Reflike};
+use rustc_abi::{FieldIdx, FieldsShape, HasDataLayout, Size, TagEncoding, Variants};
 use rustc_span::Span;
 
 struct Emit<'f, 'tcx> {
@@ -14,10 +14,24 @@ struct Emit<'f, 'tcx> {
     f: &'f mut Ferb::Func,
     b: Ferb::BlkId,
     blocks: IndexVec<BasicBlock, Ferb::BlkId>,
-    locals: IndexVec<Local, Ferb::Ref>,
+    locals: IndexVec<Local, Val>,
     instance: Instance<'tcx>,
     start_block: Ferb::BlkId,
     mir: &'tcx Body<'tcx>,
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
+struct Val {
+    r: Ferb::Ref,
+    kind: ValKind,
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
+enum ValKind {
+    Scalar,
+    Pair,  // same repr as Memory but fields immutable and only accessed by casts 
+    Memory,
+    Undef,
 }
 
 pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Module {
@@ -31,10 +45,11 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
                 let mut f = Ferb::Func::new(id, Ferb::Ret::K(Kl));
                 let mir = tcx.instance_mir(it.def);
                 let start_block = f.blk();
+                let undef = Val { r: Ferb::Ref::Undef, kind: ValKind::Undef };
                 let mut emit = Emit {
                     tcx,
                     blocks: mir.basic_blocks.iter().map(|_| f.blk()).collect(),
-                    locals: mir.local_decls.iter().map(|_| f.tmp()).collect(),
+                    locals: mir.local_decls.iter().map(|_| undef).collect(),
                     b: start_block,
                     m: &mut m,
                     f: &mut f,
@@ -43,7 +58,17 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
                     mir,
                 };
                 for i in 0..mir.arg_count {
-                    emit.f.emit(emit.b, O::par, Kl, emit.locals[Local::new(i + 1)], (), ());
+                    let mut r = emit.tmp();
+                    emit.emit(O::par, Kl, r, Val::R, Val::R);
+                    let local = Local::new(i + 1);
+                    let ty = mir.local_decls[local].ty;
+                    if ty.is_adt() {
+                        r.kind = ValKind::Memory;
+                    }
+                    if ty.is_any_ptr() && (ty.builtin_deref(true).unwrap().is_str() || ty.builtin_deref(true).unwrap().is_array_slice()) {
+                        r.kind = ValKind::Pair;
+                    }
+                    emit.locals[local] = r;
                 }
                 
                 emit.f.jump(emit.b, J::jmp, (), Some(emit.blocks[BasicBlock::new(0)]), None);
@@ -81,22 +106,28 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 self.f.jump(self.b, J::jmp, (), Some(self.blocks[target]), None);
             }
             TerminatorKind::Return => {
-                self.f.jump(self.b, J::retl, self.locals[RETURN_PLACE], None, None);
+                let r = self.locals[RETURN_PLACE];
+                assert!(r.kind == ValKind::Scalar);
+                self.f.jump(self.b, J::retl, r.r, None, None);
             }
             TerminatorKind::Call { func, args, destination, target, .. } => {
-                let dest = self.locals[destination.local];
                 let callee = self.emit_operand(func);
+                
+                let args = args.iter().map(|arg| self.emit_operand(&arg.node)).collect::<Vec<_>>();
                 for arg in args {
-                    let arg = self.emit_operand(&arg.node);
-                    self.f.emit(self.b, O::arg, Kl, (), arg, ());
+                    self.f.emit(self.b, O::arg, Kl, (), arg.r, ());
                 }
-                self.f.emit(self.b, O::call, Kl, dest, callee, ());
+                let r = self.tmp();
+                self.emit(O::call, Kl, r, callee, Val::R);
+                self.store_place(destination, r);
                 let j = target.map(|_| J::jmp).unwrap_or(J::hlt);
                 let target = target.map(|it| self.blocks[it]);
                 self.f.jump(self.b, j, (), target, None);
             }
             TerminatorKind::SwitchInt { discr, targets } => {
                 let discr = self.emit_operand(discr);
+                assert!(discr.kind == ValKind::Scalar);
+                let discr = discr.r;
                 if let Some((val, a, b)) = targets.as_static_if() {
                     if val == 0 {
                         // TODO: don't assume Kw
@@ -121,7 +152,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         }
     }
     
-    fn emit_value(&mut self, value: &Rvalue<'tcx>) -> Ferb::Ref {
+    fn emit_value(&mut self, value: &Rvalue<'tcx>) -> Val {
         match value {
             Rvalue::Use(operand) => self.emit_operand(operand),
             Rvalue::RawPtr(_, place) => {
@@ -142,6 +173,10 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         }
                         todo!("PtrToPtr {:?} {:?}", src_ty, dest_ty);
                     }
+                    CastKind::IntToInt => {
+                        assert!(dest_ty.primitive_size(self.tcx) == src_ty.primitive_size(self.tcx));
+                        src
+                    },
                     _ => todo!("{:?}", value),
                 }
             }
@@ -158,8 +193,8 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 let (lhs, rhs) = (self.emit_operand(lhs), self.emit_operand(rhs));
                 // TODO: don't assume u64
                 let op = choose_op(*op, false);
-                let r = self.f.tmp();
-                self.f.emit(self.b, op, Kl, r, lhs, rhs);
+                let r = self.tmp();
+                self.emit(op, Kl, r, lhs, rhs);
                 // TODO: mask if explicitly wrapping
                 r
             }
@@ -171,22 +206,35 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         let ty = self.finish_type(def, args);
                         let mut layout = self.layout_of(ty);
                         // TODO: pass in the place instead
-                        let base = self.alloca(layout.size.bytes_usize() as i64);
+                        let size = layout.size.bytes_usize();
+                        let base = self.alloca(size as i64, ValKind::Memory);
                         if let Variants::Multiple { tag_encoding, tag_field, .. } = &layout.variants {
                             assert!(layout.fields.count() == 1 && tag_encoding == &TagEncoding::Direct);
                             let offset = layout.fields.offset(tag_field.as_usize());
                             let r = self.offset(base, offset);
                             let value = varient.as_u32() as u64;
-                            self.f.emit(self.b, O::storel, Kw, (), value, r);
+                            let value = self.r(value);
+                            self.emit(O::storel, Kw, Val::R, value, r);
                             layout = layout.for_variant(self, varient);
                         }
                         
                         for field in layout.fields.index_by_increasing_offset() {
                             let value = &fields[FieldIdx::new(field)];
-                            let value = self.emit_operand(value);
+                            let v = self.emit_operand(value);
                             let offset = layout.fields.offset(field);
                             let r = self.offset(base, offset);
-                            self.f.emit(self.b, O::storel, Kw, (), value, r);
+                            
+                            match v.kind {
+                                ValKind::Scalar => self.emit(O::storel, Kw, Val::R, v, r),
+                                ValKind::Pair => todo!(),
+                                ValKind::Memory => {
+                                    let ty = value.ty(self.mir, self.tcx);
+                                    let layout = self.layout_of(ty);
+                                    let size = layout.size.bytes_usize();
+                                    self.f.blit(self.b, r.r, v.r, size);
+                                }
+                                ValKind::Undef => todo!(),
+                            }
                         }
                         base
                     }
@@ -199,36 +247,44 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 let layout = self.layout_of(ty.ty);
                 if let Variants::Multiple { tag_encoding, tag_field, .. } = &layout.variants {
                     assert!(layout.fields.count() == 1 && tag_encoding == &TagEncoding::Direct);
+                    assert!(matches!(base.kind, ValKind::Memory));
                     let offset = layout.fields.offset(tag_field.as_usize());
                     let base = self.offset(base, offset);
-                    let r = self.f.tmp();
-                    self.f.emit(self.b, O::load, Kl, r, base, ());
+                    let r = self.tmp();
+                    self.emit(O::load, Kl, r, base, Val::R);
                     return r;
                 }
                 todo!("discriminant {:?}", place)
             }
+            Rvalue::Ref(_, _, place) => self.addr_place(place),
             _ => todo!("{:?}", value),
         }
     }
     
-    fn offset(&mut self, r: Ferb::Ref, off: Size) -> Ferb::Ref {
-        if off.bytes() == 0 { return r; }
-        let r2 = self.f.tmp();
-        self.f.emit(self.b, O::add, Kl, r2, r, off.bytes());
-        r2
+    fn tmp(&mut self) -> Val {
+        Val { r: self.f.tmp(), kind: ValKind::Scalar }
     }
     
-    fn addr_place(&mut self, place: &Place<'tcx>) -> Ferb::Ref {
+    fn offset(&mut self, r: Val, off: Size) -> Val {
+        if off.bytes() == 0 { return r; }
+        let r2 = self.tmp();
+        let off = self.r(off.bytes());
+        self.emit(O::add, Kl, r2, r, off);
+        Val { r: r2.r, kind: r.kind }
+    }
+    
+    fn addr_place(&mut self, place: &Place<'tcx>) -> Val {
         let ty = place.ty(self.mir, self.tcx);
         if let Some(it) = place.as_local() {
             return self.locals[it];
         }
         let mut base = self.locals[place.local];
         let mut parent_ty = self.mir.local_decls[place.local].ty;
+        assert!(matches!(base.kind, ValKind::Memory));
         for it in place.projection.iter() {
             use ProjectionElem::*;
             match it.kind() {
-                Deref => todo!(),
+                Deref => (),  // TODO: this can't be right
                 Field(field_idx, ()) => {
                     use FieldsShape::*;
                     let layout = self.layout_of(parent_ty);
@@ -252,29 +308,53 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         base
     }
     
-    // when place.as_local, addr_place could still be a stack address 
-    // (for wide pointers) which is convoluted. should make it more consistant. 
-    // have something like compiler/emit_ir.fr/Placement that i can pass around. 
-    fn store_place(&mut self, place: &Place<'tcx>, r: Ferb::Ref) {
-        let base = self.addr_place(place);
-        if place.as_local().is_some() {
-            self.f.emit(self.b, O::copy, Kl, base, r, ());
-            return;
+    fn store_place(&mut self, place: &Place<'tcx>, mut r: Val) {
+        if let Some(local) = place.as_local() {
+            if self.locals[local].kind == ValKind::Undef {
+                if r.kind == ValKind::Scalar {
+                    let v = self.tmp();
+                    self.emit(O::copy, Kl, v, r, Val::R);
+                    r = v;
+                }
+                self.locals[local] = r;
+                return;
+            }
         }
-        self.f.emit(self.b, O::storel, Kw, (), r, base);
+        let base = self.addr_place(place);
+        match base.kind {
+            ValKind::Scalar | ValKind::Pair => self.emit(O::copy, Kl, base, r, Val::R),
+            ValKind::Memory => {
+                assert!(r.kind == ValKind::Scalar);
+                self.emit(O::storel, Kw, Val::R, r, base);
+            }
+            ValKind::Undef => todo!(),
+        };
     }
     
-    fn load_place(&mut self, place: &Place<'tcx>) -> Ferb::Ref {
+    fn load_place(&mut self, place: &Place<'tcx>) -> Val {
+        let ty = place.ty(self.mir, self.tcx).ty;
         let base = self.addr_place(place);
-        if place.as_local().is_some() {
-            return base;
+        let mut r = self.tmp();
+        match base.kind {
+            ValKind::Scalar => self.emit(O::copy, Kl, r, base, Val::R),
+            ValKind::Pair => {
+                self.emit(O::copy, Kl, r, base, Val::R);
+                r.kind = ValKind::Pair;
+            }
+            ValKind::Memory => {
+                if ty.is_adt() { return base; }
+                self.emit(O::load, Kl, r, base, Val::R);
+            }
+            ValKind::Undef => todo!(),
         }
-        let r = self.f.tmp();
-        self.f.emit(self.b, O::load, Kl, r, base, ());
         r
     }
     
-    fn emit_operand(&mut self, operand: &Operand<'tcx>) -> Ferb::Ref {
+    fn r(&mut self, r: impl Reflike) -> Val {
+        Val { r: r.r(self.f), kind: ValKind::Scalar }
+    }
+    
+    fn emit_operand(&mut self, operand: &Operand<'tcx>) -> Val {
         match operand {
             Operand::Copy(place) => self.load_place(place),
             Operand::Move(place) => self.load_place(place),
@@ -285,7 +365,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         match it {
                             Scalar::Int(it) => {
                                 let it = it.to_u64() as i64;
-                                return self.f.con(Ferb::Id::None, it);
+                                return self.r(it);
                             }
                             Scalar::Ptr(p, _) => {
                                 let (p, off) = p.prov_and_relative_offset();
@@ -301,7 +381,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                                 let mono = TypingEnv::fully_monomorphized();
                                 let instance = Instance::expect_resolve(self.tcx, mono, def, args, span);
                                 let id = self.m.intern(self.tcx.symbol_name(instance).name);
-                                return self.f.con(id, 0);
+                                return self.r(id);
                             },
                             _ => todo!("zst {:?}", ty)
                         }
@@ -318,23 +398,24 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     }
     
     // TODO: dumb because i know im slow at promoting if you keep recalculating the address for the second slot.
-    fn create_pair(&mut self, a: impl Ferb::Reflike, b: impl Ferb::Reflike) -> Ferb::Ref {
-        let r = self.alloca(16);
+    fn create_pair(&mut self, a: Val, b: impl Reflike) -> Val {
+        let b = self.r(b);
+        let r = self.alloca(16, ValKind::Pair);
         let r2 = self.offset(r, Size::from_bytes(8));
-        self.f.emit(self.b, O::storel, Kw, (), a, r);
-        self.f.emit(self.b, O::storel, Kw, (), b, r2);
+        self.emit(O::storel, Kw, Val::R, a, r);
+        self.emit(O::storel, Kw, Val::R, b, r2);
         r
     }
     
-    fn get_pair_slot(&mut self, addr: impl Ferb::Reflike, first: bool) -> Ferb::Ref {
-        let addr = addr.r(self.f);
+    fn get_pair_slot(&mut self, addr: Val, first: bool) -> Val {
+        assert!(addr.kind == ValKind::Pair);
         let addr = self.offset(addr, Size::from_bytes(if first { 0 } else { 8 }));
-        let r = self.f.tmp();
-        self.f.emit(self.b, O::load, Kl, r, addr, ());
+        let r = self.tmp();
+        self.emit(O::load, Kl, r, addr, Val::R);
         r
     }
     
-    fn global_alloc(&mut self, p: AllocId, off: Size, ty: Ty) -> Ferb::Ref {
+    fn global_alloc(&mut self, p: AllocId, off: Size, ty: Ty) -> Val {
         let p = self.tcx.global_alloc(p);
         assert_eq!(off.bytes(), 0, "TODO: offset ptr");
         match p {
@@ -349,16 +430,16 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     template: Ferb::Template::Bytes(bytes),
                     rel: vec![],
                 });
-                return self.f.con(id, 0);
+                return self.r(id);
             }
             _ => todo!("{:?} {:?}", p, ty),
         }
     }
     
-    fn alloca(&mut self, size: i64) -> Ferb::Ref {
+    fn alloca(&mut self, size: i64, kind: ValKind) -> Val {
         let r = self.f.tmp();
         self.f.emit(self.start_block, O::alloc8, Kl, r, size, ());
-        r
+        Val { r, kind }
     }
     
     // gets rid of ::Unevaluated
@@ -375,6 +456,14 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         let mono = TypingEnv::fully_monomorphized();
         self.tcx.instantiate_and_normalize_erasing_regions(args, mono, ty)
     }
+
+    pub fn emit(&mut self, o: O, k: Ferb::Cls, to: Val, a0: Val, a1: Val) {
+        self.f.emit(self.b, o, k, to.r, a0.r, a1.r);
+    }
+}
+
+impl Val {
+    const R: Self = Self { r: Ferb::Ref::Null, kind: ValKind::Scalar, };
 }
 
 fn choose_op(op: BinOp, signed: bool) -> Ferb::O {
@@ -424,4 +513,3 @@ impl<'tcx> LayoutOfHelpers<'tcx> for Emit<'_, 'tcx> {
         todo!()
     }
 }
-

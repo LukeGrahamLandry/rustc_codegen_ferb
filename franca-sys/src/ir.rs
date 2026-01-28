@@ -129,7 +129,7 @@ pub enum RefKind {
     RType,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Eq, PartialEq)]
 pub struct Ref(pub u32);
 
 #[repr(C)]
@@ -428,4 +428,12 @@ impl Ref {
     pub const Null: Ref = Ref(0);
     pub const Undef: Ref = pack_ref(RefKind::RCon, 0);
     pub const Zero: Ref = pack_ref(RefKind::RCon, 1);
+}
+
+impl Debug for Ref {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind: RefKind = unsafe { std::mem::transmute(self.0 & 0b111) };
+        let val = self.0 >> 3;
+        write!(f, "{:?}({})", kind, val)
+    }
 }

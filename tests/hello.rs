@@ -8,7 +8,8 @@ pub extern "C" fn main() -> usize {
     #[allow(unused_assignments)]
     let mut s = "nope";
     s = " World\0";
-    let mut n = important_value(30, 5).wrapping_add(s.len());
+    let five = another(0, Thing { a: 2u64 as usize, b: 3, });
+    let mut n = important_value(30, five).wrapping_add(s.len());
     let s = s.as_ptr();
     let a = match n.wrapping_sub(41) {
         0 => 41,
@@ -40,9 +41,19 @@ pub extern "C" fn main() -> usize {
     return n.wrapping_sub(t.a);
 }
 
+fn another(a: usize, b: Thing) -> usize {
+    let t = Thing { a, b: b.b, };
+    let t = Things { t };
+    t.t.a.wrapping_add(t.t.b).wrapping_add(b.a)
+}
+
 struct Thing {
     a: usize,
     b: usize,
+}
+
+struct Things {
+    t: Thing,
 }
 
 fn important_value(a: usize, b: usize) -> usize {
