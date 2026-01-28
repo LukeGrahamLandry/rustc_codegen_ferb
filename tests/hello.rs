@@ -25,6 +25,18 @@ pub extern "C" fn main() -> usize {
         n = n.wrapping_sub(1);
         t.a = t.a.wrapping_sub(1);
     }
+    
+    let foo = Some(n);
+    let n = match foo {
+        Some(n) => n,
+        None => 456,
+    };
+    let foo: Option<usize> = None;
+    let n = match foo {
+        Some(_) => 123,
+        None => n,
+    };
+    
     return n.wrapping_sub(t.a);
 }
 

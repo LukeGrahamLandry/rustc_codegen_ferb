@@ -1,11 +1,11 @@
 use rustc_const_eval::interpret::{AllocId, GlobalAlloc, Scalar, alloc_range};
 use rustc_hir::def_id::DefId;
 use rustc_index::{Idx, IndexVec};
-use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}}, ty::{EarlyBinder, Instance, Ty, TyCtxt, TyKind, TypingEnv, layout::{self, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers}}};
+use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}}, ty::{EarlyBinder, GenericArgsRef, Instance, Ty, TyCtxt, TyKind, TypingEnv, layout::{self, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers}}};
 use ferb::builder as Ferb;
 use Ferb::Cls::*;
 use Ferb::{J, O};
-use rustc_abi::{FieldIdx, FieldsShape, HasDataLayout, Size};
+use rustc_abi::{FieldIdx, FieldsShape, HasDataLayout, Primitive, Size, TagEncoding, Variants};
 use rustc_span::Span;
 
 struct Emit<'f, 'tcx> {
@@ -116,6 +116,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 }
                 self.f.jump(self.b, J::jmp, (), Some(self.blocks[targets.otherwise()]), None);
             }
+            TerminatorKind::Unreachable => self.f.jump(self.b, J::hlt, (), None, None),
             _ => todo!("{:?}", terminator),
         }
     }
@@ -166,13 +167,20 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 use rustc_middle::mir::AggregateKind::*;
                 match **kind {
                     Adt(def, varient, args, _, active) => {
-                        assert!(varient.as_u32() == 0, "TODO: tagged");
                         assert!(active.is_none(), "TODO: union");
-                        assert!(args.len() == 0, "TODO: generic");
-                        let ty = self.finish_type(def);
-                        let layout = self.layout_of(ty);
+                        let ty = self.finish_type(def, args);
+                        let mut layout = self.layout_of(ty);
                         // TODO: pass in the place instead
                         let base = self.alloca(layout.size.bytes_usize() as i64);
+                        if let Variants::Multiple { tag_encoding, tag_field, .. } = &layout.variants {
+                            assert!(layout.fields.count() == 1 && tag_encoding == &TagEncoding::Direct);
+                            let offset = layout.fields.offset(tag_field.as_usize());
+                            let r = self.offset(base, offset);
+                            let value = varient.as_u32() as u64;
+                            self.f.emit(self.b, O::storel, Kw, (), value, r);
+                            layout = layout.for_variant(self, varient);
+                        }
+                        
                         for field in layout.fields.index_by_increasing_offset() {
                             let value = &fields[FieldIdx::new(field)];
                             let value = self.emit_operand(value);
@@ -184,6 +192,20 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     }
                     _ => todo!("{:?}", value),
                 }
+            }
+            Rvalue::Discriminant(place) => {
+                let base = self.addr_place(place);
+                let ty = place.ty(self.mir, self.tcx);
+                let layout = self.layout_of(ty.ty);
+                if let Variants::Multiple { tag_encoding, tag_field, .. } = &layout.variants {
+                    assert!(layout.fields.count() == 1 && tag_encoding == &TagEncoding::Direct);
+                    let offset = layout.fields.offset(tag_field.as_usize());
+                    let base = self.offset(base, offset);
+                    let r = self.f.tmp();
+                    self.f.emit(self.b, O::load, Kl, r, base, ());
+                    return r;
+                }
+                todo!("discriminant {:?}", place)
             }
             _ => todo!("{:?}", value),
         }
@@ -197,26 +219,37 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     }
     
     fn addr_place(&mut self, place: &Place<'tcx>) -> Ferb::Ref {
-        let ty = self.mir.local_decls[place.local].ty;
-        let layout = self.layout_of(ty);
+        let ty = place.ty(self.mir, self.tcx);
         if let Some(it) = place.as_local() {
             return self.locals[it];
         }
-        assert!(place.projection.len() == 1);
-        let it = &place.projection[0];
-        use ProjectionElem::*;
-        match it.kind() {
-            Deref => todo!(),
-            Field(field_idx, _) => {
-                use FieldsShape::*;
-                let offsets = match &layout.fields {
-                    Arbitrary { offsets, .. } => offsets,
-                    _ => todo!("{:?}", place),
-                };
-                return self.offset(self.locals[place.local], offsets[field_idx]);
+        let mut base = self.locals[place.local];
+        let mut parent_ty = self.mir.local_decls[place.local].ty;
+        for it in place.projection.iter() {
+            use ProjectionElem::*;
+            match it.kind() {
+                Deref => todo!(),
+                Field(field_idx, ()) => {
+                    use FieldsShape::*;
+                    let layout = self.layout_of(parent_ty);
+                    let offsets = match &layout.fields {
+                        Arbitrary { offsets, .. } => offsets,
+                        Primitive => return base,
+                        _ => todo!("{:?}", place),
+                    };
+                    base = self.offset(base, offsets[field_idx]);
+                }
+                Downcast(_, varient) => {
+                    let layout = self.layout_of(parent_ty);
+                    let layout = layout.for_variant(self, varient);
+                    let first = layout.layout.fields.index_by_increasing_offset().next().unwrap();
+                    base = self.offset(base, layout.fields.offset(first));
+                },
+                _ => todo!("{:?}", place),
             }
-            _ => todo!("{:?}", place),
+            parent_ty = ty.projection_ty(self.tcx, it).ty;
         }
+        base
     }
     
     // when place.as_local, addr_place could still be a stack address 
@@ -337,10 +370,10 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         (val, v.ty())
     }
     
-    fn finish_type(&mut self, def: DefId) -> Ty<'tcx> {
+    fn finish_type(&mut self, def: DefId, args: GenericArgsRef<'tcx>) -> Ty<'tcx> {
         let ty = self.tcx.type_of(def);
         let mono = TypingEnv::fully_monomorphized();
-        self.instance.instantiate_mir_and_normalize_erasing_regions(self.tcx, mono, ty)
+        self.tcx.instantiate_and_normalize_erasing_regions(args, mono, ty)
     }
 }
 
