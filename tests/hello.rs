@@ -8,7 +8,7 @@ pub extern "C" fn main() -> usize {
     #[allow(unused_assignments)]
     let mut s = "nope";
     s = " World\0";
-    let five = another(0, Thing { a: 2u64 as usize, b: 3, });
+    let five = another(0, Thing { a: 2u64 as usize, b: 3, c: 0f64 });
     let mut n = important_value(30, five).wrapping_add(s.len());
     let s = s.as_ptr();
     let a = match n.wrapping_sub(41) {
@@ -17,12 +17,14 @@ pub extern "C" fn main() -> usize {
         2 => 40,
         _ => 39,
     };
-    let mut t = Thing { a, b: 42, };
+    let value = 1f64;
+    let mut t = Thing { a, b: 42, c: value + 1f64};
     if n <= t.a {
         unsafe { puts(S); };
     }
+    let x = 4;
     while n >= t.b {
-        unsafe { printf("%s %ld\n\0".as_ptr(), s, n) };
+        unsafe { printf("%s %d%.0f\n\0".as_ptr(), s, x, t.c) };
         n = n.wrapping_sub(1);
         t.a = t.a.wrapping_sub(1);
     }
@@ -42,7 +44,7 @@ pub extern "C" fn main() -> usize {
 }
 
 fn another(a: usize, b: Thing) -> usize {
-    let t = Thing { a, b: b.b, };
+    let t = Thing { a, b: b.b, c: 0f64 };
     let t = Things { t };
     t.t.a.wrapping_add(t.t.b).wrapping_add(b.a)
 }
@@ -50,6 +52,7 @@ fn another(a: usize, b: Thing) -> usize {
 struct Thing {
     a: usize,
     b: usize,
+    c: f64,
 }
 
 struct Things {

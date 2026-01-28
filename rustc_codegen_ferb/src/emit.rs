@@ -24,6 +24,7 @@ struct Emit<'f, 'tcx> {
 struct Val {
     r: Ferb::Ref,
     kind: ValKind,
+    k: Ferb::Cls,
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -45,7 +46,7 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
                 let mut f = Ferb::Func::new(id, Ferb::Ret::K(Kl));
                 let mir = tcx.instance_mir(it.def);
                 let start_block = f.blk();
-                let undef = Val { r: Ferb::Ref::Undef, kind: ValKind::Undef };
+                let undef = Val { r: Ferb::Ref::Undef, kind: ValKind::Undef, k: Kw };
                 let mut emit = Emit {
                     tcx,
                     blocks: mir.basic_blocks.iter().map(|_| f.blk()).collect(),
@@ -58,16 +59,12 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
                     mir,
                 };
                 for i in 0..mir.arg_count {
-                    let mut r = emit.tmp();
-                    emit.emit(O::par, Kl, r, Val::R, Val::R);
                     let local = Local::new(i + 1);
                     let ty = mir.local_decls[local].ty;
-                    if ty.is_adt() {
-                        r.kind = ValKind::Memory;
-                    }
-                    if ty.is_any_ptr() && (ty.builtin_deref(true).unwrap().is_str() || ty.builtin_deref(true).unwrap().is_array_slice()) {
-                        r.kind = ValKind::Pair;
-                    }
+                    let (k, kind) = emit.cls(ty);
+                    let mut r = emit.tmp(k);
+                    r.kind = kind;
+                    emit.emit(O::par, k, r, Val::R, Val::R);
                     emit.locals[local] = r;
                 }
                 
@@ -120,14 +117,17 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         assert!(sig.c_variadic());
                         self.f.emit(self.b, O::argv, Kw, (), (), ());
                     }
-                    self.f.emit(self.b, O::arg, Kl, (), arg.r, ());
+                    // TODO: struct abi
+                    self.f.emit(self.b, O::arg, arg.k, (), arg.r, ());
                 }
                 if sig.c_variadic() && args.len() == arg_count {
                     // wasm cares if variadic even if none passed
                     self.f.emit(self.b, O::argv, Kw, (), (), ());
                 }
-                let r = self.tmp();
-                self.emit(O::call, Kl, r, callee, Val::R);
+                
+                let (k, _) = self.cls(sig.output().skip_binder());
+                let r = self.tmp(k);
+                self.emit(O::call, k, r, callee, Val::R);
                 self.store_place(destination, r);
                 let j = target.map(|_| J::jmp).unwrap_or(J::hlt);
                 let target = target.map(|it| self.blocks[it]);
@@ -199,11 +199,16 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 }
             }
             Rvalue::BinaryOp(op, box(lhs, rhs)) => {
+                let is_cmp = matches!(*op, BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Ne | BinOp::Ge | BinOp::Gt);
+                if is_cmp && self.cls(lhs.ty(self.mir, self.tcx)).0 != Kl {
+                    todo!()
+                }
+                let out_ty = value.ty(self.mir, self.tcx);
                 let (lhs, rhs) = (self.emit_operand(lhs), self.emit_operand(rhs));
-                // TODO: don't assume u64
-                let op = choose_op(*op, false);
-                let r = self.tmp();
-                self.emit(op, Kl, r, lhs, rhs);
+                let op = choose_op(*op, out_ty.is_signed());
+                let k = self.cls(out_ty).0;
+                let r = self.tmp(k);
+                self.emit(op, k, r, lhs, rhs);
                 // TODO: mask if explicitly wrapping
                 r
             }
@@ -222,7 +227,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                             let offset = layout.fields.offset(tag_field.as_usize());
                             let r = self.offset(base, offset);
                             let value = varient.as_u32() as u64;
-                            let value = self.r(value);
+                            let value = self.r(value, Kl);
                             self.emit(O::storel, Kw, Val::R, value, r);
                             layout = layout.for_variant(self, varient);
                         }
@@ -232,9 +237,8 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                             let v = self.emit_operand(value);
                             let offset = layout.fields.offset(field);
                             let r = self.offset(base, offset);
-                            
                             match v.kind {
-                                ValKind::Scalar => self.emit(O::storel, Kw, Val::R, v, r),
+                                ValKind::Scalar => self.emit(Ferb::store(v.k), Kw, Val::R, v, r),
                                 ValKind::Pair => todo!(),
                                 ValKind::Memory => {
                                     let ty = value.ty(self.mir, self.tcx);
@@ -259,7 +263,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     assert!(matches!(base.kind, ValKind::Memory));
                     let offset = layout.fields.offset(tag_field.as_usize());
                     let base = self.offset(base, offset);
-                    let r = self.tmp();
+                    let r = self.tmp(Kl);
                     self.emit(O::load, Kl, r, base, Val::R);
                     return r;
                 }
@@ -270,16 +274,16 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         }
     }
     
-    fn tmp(&mut self) -> Val {
-        Val { r: self.f.tmp(), kind: ValKind::Scalar }
+    fn tmp(&mut self, k: Ferb::Cls) -> Val {
+        Val { r: self.f.tmp(), kind: ValKind::Scalar, k }
     }
     
     fn offset(&mut self, r: Val, off: Size) -> Val {
         if off.bytes() == 0 { return r; }
-        let r2 = self.tmp();
-        let off = self.r(off.bytes());
+        let r2 = self.tmp(Kl);
+        let off = self.r(off.bytes(), Kl);
         self.emit(O::add, Kl, r2, r, off);
-        Val { r: r2.r, kind: r.kind }
+        Val { r: r2.r, kind: r.kind, k: Kl, }
     }
     
     fn addr_place(&mut self, place: &Place<'tcx>) -> Val {
@@ -321,8 +325,8 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         if let Some(local) = place.as_local() {
             if self.locals[local].kind == ValKind::Undef {
                 if r.kind == ValKind::Scalar {
-                    let v = self.tmp();
-                    self.emit(O::copy, Kl, v, r, Val::R);
+                    let v = self.tmp(r.k);
+                    self.emit(O::copy, v.k, v, r, Val::R);
                     r = v;
                 }
                 self.locals[local] = r;
@@ -331,10 +335,10 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         }
         let base = self.addr_place(place);
         match base.kind {
-            ValKind::Scalar | ValKind::Pair => self.emit(O::copy, Kl, base, r, Val::R),
+            ValKind::Scalar | ValKind::Pair => self.emit(O::copy, r.k, base, r, Val::R),
             ValKind::Memory => {
                 assert!(r.kind == ValKind::Scalar);
-                self.emit(O::storel, Kw, Val::R, r, base);
+                self.emit(Ferb::store(r.k), Kw, Val::R, r, base);
             }
             ValKind::Undef => todo!(),
         };
@@ -342,25 +346,27 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     
     fn load_place(&mut self, place: &Place<'tcx>) -> Val {
         let ty = place.ty(self.mir, self.tcx).ty;
+        let (k, _) = self.cls(ty);
         let base = self.addr_place(place);
-        let mut r = self.tmp();
+        let mut r = self.tmp(k);
         match base.kind {
-            ValKind::Scalar => self.emit(O::copy, Kl, r, base, Val::R),
+            ValKind::Scalar => self.emit(O::copy, k, r, base, Val::R),
             ValKind::Pair => {
+                assert!(k == Kl);
                 self.emit(O::copy, Kl, r, base, Val::R);
                 r.kind = ValKind::Pair;
             }
             ValKind::Memory => {
                 if ty.is_adt() { return base; }
-                self.emit(O::load, Kl, r, base, Val::R);
+                self.emit(O::load, k, r, base, Val::R);
             }
             ValKind::Undef => todo!(),
         }
         r
     }
     
-    fn r(&mut self, r: impl Reflike) -> Val {
-        Val { r: r.r(self.f), kind: ValKind::Scalar }
+    fn r(&mut self, r: impl Reflike, k: Ferb::Cls) -> Val {
+        Val { r: r.r(self.f), kind: ValKind::Scalar, k }
     }
     
     fn emit_operand(&mut self, operand: &Operand<'tcx>) -> Val {
@@ -373,8 +379,9 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     ConstValue::Scalar(it) => {
                         match it {
                             Scalar::Int(it) => {
-                                let it = it.to_u64() as i64;
-                                return self.r(it);
+                                let (k, _) = self.cls(operand.ty(self.mir, self.tcx));
+                                let raw = it.to_bits(it.size()) as u64;
+                                return self.r(raw, k);
                             }
                             Scalar::Ptr(p, _) => {
                                 let (p, off) = p.prov_and_relative_offset();
@@ -390,7 +397,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                                 let mono = TypingEnv::fully_monomorphized();
                                 let instance = Instance::expect_resolve(self.tcx, mono, def, args, span);
                                 let id = self.m.intern(self.tcx.symbol_name(instance).name);
-                                return self.r(id);
+                                return self.r(id, Kl);
                             },
                             _ => todo!("zst {:?}", ty)
                         }
@@ -408,7 +415,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     
     // TODO: dumb because i know im slow at promoting if you keep recalculating the address for the second slot.
     fn create_pair(&mut self, a: Val, b: impl Reflike) -> Val {
-        let b = self.r(b);
+        let b = self.r(b, Kl);
         let r = self.alloca(16, ValKind::Pair);
         let r2 = self.offset(r, Size::from_bytes(8));
         self.emit(O::storel, Kw, Val::R, a, r);
@@ -419,7 +426,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     fn get_pair_slot(&mut self, addr: Val, first: bool) -> Val {
         assert!(addr.kind == ValKind::Pair);
         let addr = self.offset(addr, Size::from_bytes(if first { 0 } else { 8 }));
-        let r = self.tmp();
+        let r = self.tmp(Kl);
         self.emit(O::load, Kl, r, addr, Val::R);
         r
     }
@@ -439,7 +446,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     template: Ferb::Template::Bytes(bytes),
                     rel: vec![],
                 });
-                return self.r(id);
+                return self.r(id, Kl);
             }
             _ => todo!("{:?} {:?}", p, ty),
         }
@@ -448,7 +455,36 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     fn alloca(&mut self, size: i64, kind: ValKind) -> Val {
         let r = self.f.tmp();
         self.f.emit(self.start_block, O::alloc8, Kl, r, size, ());
-        Val { r, kind }
+        Val { r, kind, k: Kl, }
+    }
+    
+    fn cls(&self, ty: Ty<'tcx>) -> (Ferb::Cls, ValKind) {
+        if ty.is_adt() {
+            return (Kl, ValKind::Memory);
+        }
+        if ty.is_any_ptr() {
+            let inner = ty.builtin_deref(true).unwrap();
+            let wide = inner.is_str() || inner.is_array_slice();
+            return (Kl, if wide { ValKind::Pair } else { ValKind::Scalar });
+        }
+        use rustc_ast::UintTy::*;
+        let k = |it| match it {
+            U8 | U16 | U32 => Kw,
+            U64 | Usize /*TODO*/ => Kl,
+            U128 => todo!(),
+        };
+        (match ty.kind() {
+            TyKind::Bool | TyKind::Char => Kw,
+            TyKind::Int(it) => k(it.to_unsigned()),
+            TyKind::Uint(it) => k(*it),
+            TyKind::Float(it) => match it.bit_width() {
+                32 => Ks,
+                64 => Kd,
+                n => todo!("f{}", n),
+            },
+            TyKind::FnDef(_, _) | TyKind::FnPtr(_, _) => Kl,
+            _ => todo!("{:?}", ty),
+        }, ValKind::Scalar)
     }
     
     // gets rid of ::Unevaluated
@@ -472,12 +508,12 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
 }
 
 impl Val {
-    const R: Self = Self { r: Ferb::Ref::Null, kind: ValKind::Scalar, };
+    const R: Self = Self { r: Ferb::Ref::Null, kind: ValKind::Scalar, k: Kw, };
 }
 
 fn choose_op(op: BinOp, signed: bool) -> Ferb::O {
     use Ferb::O::*;
-    use BinOp::*;
+    use BinOp::*;    
     match op {
         Add | AddUnchecked => add,
         Sub | SubUnchecked => sub,

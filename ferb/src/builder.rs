@@ -392,6 +392,15 @@ fn field_size(it: FieldType) -> Option<u32> {
     })
 }
 
+pub fn store(k: Cls) -> O {
+    match k {
+        Cls::Kw => O::storew,
+        Cls::Kl => O::storel,
+        Cls::Ks => O::stores,
+        Cls::Kd => O::stored,
+    }
+}
+
 // this exists because you can't call f.emit(_, _, _, f.con(Id::None, 0), _) 
 // because it counts as two mutable references. this lets it work without always adding extra name bindings.
 
