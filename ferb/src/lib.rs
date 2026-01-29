@@ -1,4 +1,5 @@
 pub mod builder;
+#[cfg(test)]
 mod examples;
 
 // TODO: target. choose obj or exe or dylib. 

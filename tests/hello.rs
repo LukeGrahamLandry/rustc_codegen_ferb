@@ -57,7 +57,14 @@ pub extern "C" fn main() -> usize {
         value += i;
     }
     value -= 1;
-    return value;
+    Some(2i32).unwrap();
+    let x = 0usize;
+    let x = x as u32;
+    if x != 0 { return 3 };
+    let v: fn() = voidcall;
+    v();
+    let vv = [(1, 1), (1usize, value), (1, 1)];
+    return vv[1].1;
 }
 
 fn dont_skip_deref_layout(foo: &(usize, usize)) -> bool {

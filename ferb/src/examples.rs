@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 use franca_sys::*;
 use crate::builder::*;
 
@@ -17,22 +15,29 @@ fn jit_add() {
     f.jump(b, J::retl, r[2], None, None);
     m.func(f);
     
+    jitted(m, &[name], |f| {
+        let f: fn(a: i64, b: i64) -> i64 = unsafe { std::mem::transmute(f[0]) }; 
+        assert_eq!(f(1, 2), 3);
+        assert_eq!(f(20, -5), 15);
+    });
+}
+
+fn jitted(m: Module, name: &[&str], then: impl FnOnce(&[u64])) {
+    assert!(name.len() == 1);
     let bytes = m.finish();
     unsafe {
         let fr = init_globals();
         let mut cmd = CompileCmd {
             frc: Slice::from(&bytes[0..]),
             out: Slice::from("".as_bytes()),
-            name: Slice::from(name.as_bytes()),
+            name: Slice::from(name[0].as_bytes()),
             logging: Slice::from("".as_bytes()),
             p: 0,
             m: 0,
             jit: 1,
         };
         compile_one(fr, &mut cmd);
-        let f: fn(a: i64, b: i64) -> i64 = std::mem::transmute(cmd.p); 
-        assert_eq!(f(1, 2), 3);
-        assert_eq!(f(20, -5), 15);
+        then(&[cmd.p]);
         drop_module(fr, &mut cmd);
     };
 }

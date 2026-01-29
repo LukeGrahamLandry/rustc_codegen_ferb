@@ -5,35 +5,56 @@ main :: fn() void = {
         fn macos() => "dylib";
         fn linux() => "so";
     };
+    cg := @tfmt("codegen-backend=target/debug/librustc_codegen_ferb.%", suffix);
     
     // TODO: RUSTFLAGS="--remap-path-prefix $HOME=~ --remap-path-prefix $(pwd)=."
     sh(@slice("cargo", "build"));
     sh(@slice("cargo", "test", "--tests", "--package", "ferb"));
     
     // opt-level=3 enables inlining (and presumably other stuff), gives me simpler ir to deal with. 
-    opt_levels := @slice(3, 0);
-    for opt_levels { opt_level |
-        // makes it not create rustc-ice-DATE.txt when i crash... which happens a lot :(
-        // TODO: RUSTC_ICE="0"
+    opt_levels := @slice(3, 2, 1, 0);
+    tests := collect_with_extension("tests", ".rs") || panic("missing ./tests folder");
+    for tests { file |
+        @assert(file.ends_with(".rs"));
+        src := @tfmt("tests/%", file);
+        exe := @tfmt("./target/%", file.slice(0, file.len - 3)); 
         
-        args := @slice(
-            "rustc",
-            "tests/hello.rs",
-            "-C", @tfmt("opt-level=%", opt_level),
-            "-Z", @tfmt("codegen-backend=target/debug/librustc_codegen_ferb.%", suffix),
-            "-C", "panic=abort",
-            "-lc",
-            "-Z", "dump-mir-dir=target/mir_dump",
-            "--out-dir", "target",
-            "-Z", "dump-mir= & PreCodegen",
-        );
-        sh(args);
-        ok, out, err := exec_and_catch("./target/hello", empty(), temp()); 
-        @assert(ok, "exit non-zero %%", out.items(), err.items());
-        @assert_eq(out.items(), "Hello\n World 42\n", "%", err.items());
+        // run it once with llvm to make sure my test program is correct
+        args := @slice("rustc", src, "-lc", "--out-dir", "target");
+        expected, _ := compile_and_run(args, exe);
+        @println("=== % output % bytes ===", file, expected.len);
+        
+        for opt_levels { opt_level |
+            // makes it not create rustc-ice-DATE.txt when i crash... which happens a lot :(
+            // TODO: RUSTC_ICE="0"
+            
+            args := @slice(
+                "rustc",
+                src,
+                "-C", @tfmt("opt-level=%", opt_level),
+                "-Z", cg,
+                "-C", "panic=abort",
+                "-lc",
+                // "-Z", "dump-mir-dir=target/mir_dump",
+                "--out-dir", "target",
+                // "-Z", "dump-mir= & PreCodegen",
+            );
+            out, err := compile_and_run(args, exe);
+            @assert_eq(out, expected, "%", err);
+            @if(err.len != 0) @print("%\n%\n", out, err);
+        };
     };
 }
 
+compile_and_run :: fn(args: []Str, exe: Str) Ty([]u8, []u8) = {
+    sh(args);
+    ok, out, err := exec_and_catch(exe, empty(), temp()); 
+    o, e := (out.items(), err.items());
+    @assert(ok, "exit non-zero %%", o, e);
+    (o, e)
+}
+
+#use("@/examples/testing.fr");
 #use("@/lib/sys/subprocess.fr");
 #use("@/lib/sys/fs.fr");
 sh :: import("@/examples/testing.fr").sh;

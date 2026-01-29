@@ -1,7 +1,7 @@
 use rustc_const_eval::interpret::{AllocId, ConstAllocation, GlobalAlloc, Scalar, alloc_range};
 use rustc_hir::def_id::DefId;
 use rustc_index::{Idx, IndexVec, bit_set::MixedBitSet};
-use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}, pretty::MirWriter}, ty::{EarlyBinder, GenericArgsRef, Instance, PseudoCanonicalInput, Ty, TyCtxt, TyKind, TypingEnv, layout::{self, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers, TyAndLayout}, print::with_no_trimmed_paths}};
+use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, NonDivergingIntrinsic, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}, pretty::MirWriter}, ty::{EarlyBinder, GenericArgsRef, Instance, PseudoCanonicalInput, Ty, TyCtxt, TyKind, TypingEnv, adjustment::PointerCoercion, layout::{self, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers, TyAndLayout}, print::with_no_trimmed_paths}};
 use ferb::builder as Ferb;
 use Ferb::Cls::*;
 use Ferb::{J, O, Reflike};
@@ -204,6 +204,10 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 StatementKind::Nop => (),
                 StatementKind::StorageLive(_) => (),
                 StatementKind::StorageDead(_) => (),
+                StatementKind::Intrinsic(box it) => match it {
+                    NonDivergingIntrinsic::Assume(_) => (),  // not my department
+                    NonDivergingIntrinsic::CopyNonOverlapping { .. } => todo!(),
+                }
                 _ => todo!("{:?}", stmt),
             }
         }
@@ -343,10 +347,26 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     CastKind::IntToInt => {
                         let d = dest_ty.primitive_size(self.tcx).bytes();
                         let s = src_ty.primitive_size(self.tcx).bytes();
-                        assert!(d == s);
-                        src
+                        if s == d { return src };
+                        // TODO: sign
+                        // TODO: decide which direction has to guarentee high bits. rn i do it both ways. 
+                        let o = match d.min(s) {
+                            1 => O::extub,
+                            2 => O::extuh,
+                            4 if d > 4 => O::extuw,
+                            4 => O::copy,
+                            _ => todo!("{:?} {:?}", src_ty, dest_ty),
+                        };
+                        let k = if d == 8 { Kl } else { Kw };
+                        let r = self.tmp(k);
+                        self.emit(o, k, r, src, Val::R);
+                        r
                     },
                     CastKind::PointerWithExposedProvenance => src,
+                    CastKind::PointerCoercion(kind, _)  => {
+                        assert!(!matches!(kind, PointerCoercion::ClosureFnPointer(_) | PointerCoercion::Unsize));
+                        src
+                    },
                     _ => todo!("{:?}", value),
                 }
             }
@@ -357,6 +377,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         self.get_pair_slot(p, false)
                     }
                     UnOp::Not => {
+                        // TODO: what's bool bit pattern? match(bool) => b == 0 instead?
                         let r = self.emit_operand(value);
                         let r2 = self.tmp(r.k);
                         let ones = self.r(-1i64, r.k);
@@ -367,10 +388,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 }
             }
             Rvalue::BinaryOp(op, box(lhs, rhs)) => {
-                let is_cmp = matches!(*op, BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Ne | BinOp::Ge | BinOp::Gt);
-                if is_cmp && self.cls(lhs.ty(self.mir, self.tcx)).0 != Kl {
-                    todo!()
-                }
+                let in_k = self.cls(lhs.ty(self.mir, self.tcx)).0;
                 let out_ty = value.ty(self.mir, self.tcx);
                 let in_ty = lhs.ty(self.mir, self.tcx);
                 let (lhs, rhs) = (self.emit_operand(lhs), self.emit_operand(rhs));
@@ -392,6 +410,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     self.emit(O::storew, Kw, Val::R, zero, ok);
                 } else {
                     let op = choose_op(*op, out_ty.is_signed());
+                    let op = Ferb::fix_cmp_cls(op, in_k).unwrap_or(op);
                     self.emit(op, k, r, lhs, rhs);
                     // TODO: mask if explicitly wrapping
                 }
@@ -400,6 +419,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             Rvalue::Aggregate(kind, fields) => {
                 use rustc_middle::mir::AggregateKind::*;
                 let ty = value.ty(self.mir, self.tcx);
+                assert!(is_big(ty));
                 let mut layout = self.layout(ty);
                 let size = layout.size.bytes_usize();
                 // TODO: pass in the place instead
@@ -407,33 +427,36 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 match **kind {
                     Adt(_, varient, _, _, active) => {
                         assert!(active.is_none(), "TODO: union");
-                        if let Variants::Multiple { tag_encoding, tag_field, .. } = &layout.variants {
+                        if let Variants::Multiple { tag_encoding, tag_field, tag, .. } = &layout.variants {
                             assert!(layout.fields.count() == 1 && tag_encoding == &TagEncoding::Direct);
                             let offset = layout.fields.offset(tag_field.as_usize());
                             let r = self.offset(base, offset);
                             let value = varient.as_u32() as u64;
-                            let value = self.r(value, Kl);
-                            self.emit(O::storel, Kw, Val::R, value, r);
+                            let (_, o) = tag_load_store(tag);
+                            let value = self.r(value, Kw);
+                            self.emit(o, Kw, Val::R, value, r);
                             layout = layout.for_variant(self, varient);
                         }
                     }
-                    Tuple => (),
+                    Tuple | Array(_) => (),
                     _ => todo!("{:?}", value),
                 }
                 self.emit_aggregate(base, layout, fields);
                 base
             }
             Rvalue::Discriminant(place) => {
+                assert!(value.ty(self.mir, self.tcx).primitive_size(self.tcx).bytes() == /*TODO*/ 8);  // regardless of size in memory
                 let base = self.addr_place(place);
                 let ty = place.ty(self.mir, self.tcx);
                 let layout = self.layout(ty.ty);
-                if let Variants::Multiple { tag_encoding, tag_field, .. } = &layout.variants {
+                if let Variants::Multiple { tag_encoding, tag_field, tag, .. } = &layout.variants {
                     assert!(layout.fields.count() == 1 && tag_encoding == &TagEncoding::Direct);
                     assert!(matches!(base.kind, ValKind::Memory));
                     let offset = layout.fields.offset(tag_field.as_usize());
                     let base = self.offset(base, offset);
+                    let (o, _) = tag_load_store(tag);
                     let r = self.tmp(Kl);
-                    self.emit(O::load, Kl, r, base, Val::R);
+                    self.emit(o, Kl, r, base, Val::R);
                     return r;
                 }
                 todo!("discriminant {:?}", place)
@@ -486,7 +509,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         let mut base = self.locals[place.local];
         let mut parent_ty = self.mir.local_decls[place.local].ty;
         let mut projection = place.projection.iter();
-        if place.projection[0].kind() == ProjectionElem::Deref {
+        if place.is_indirect() {
             parent_ty = match parent_ty.kind() {
                 TyKind::RawPtr(inner, _) | TyKind::Ref(_, inner, _) => *inner,
                 _ => todo!(),
@@ -496,11 +519,9 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         base.kind = ValKind::Memory;
         for it in projection {
             use ProjectionElem::*;
-            match it.kind() {
-                Deref => {
-                    todo!()
-                }
-                Field(field_idx, ()) => {
+            match it {
+                Deref => unreachable!(),  // only allowed as first projection
+                Field(field_idx, inner) => {
                     assert!(matches!(base.kind, ValKind::Memory));
                     use FieldsShape::*;
                     let layout = self.layout(parent_ty);
@@ -510,17 +531,36 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         _ => todo!("{:?}", place),
                     };
                     base = self.offset(base, offsets[field_idx]);
+                    parent_ty = inner;
                 }
                 Downcast(_, varient) => {
                     assert!(matches!(base.kind, ValKind::Memory));
                     let layout = self.layout(parent_ty);
+                    if let Variants::Multiple { tag_encoding, .. } = &layout.variants {
+                        assert!(tag_encoding == &TagEncoding::Direct);
+                    };
                     let layout = layout.for_variant(self, varient);
                     let first = layout.layout.fields.index_by_increasing_offset().next().unwrap();
                     base = self.offset(base, layout.fields.offset(first));
+                    parent_ty = ty.projection_ty(self.tcx, it).ty;
                 },
+                Index(index) => {
+                    let index = self.locals[index];
+                    assert!(index.kind == ValKind::Scalar && index.k == Kl);
+                    let inner = match parent_ty.kind() {
+                        TyKind::Array(it, _) => *it,
+                        _ => todo!(),
+                    };
+                    let layout = self.layout(inner);
+                    let step = layout.size.bytes();
+                    let r = self.f.tmps::<2>();
+                    self.f.emit(self.b, O::mul, Kl, r[0], index.r, step);
+                    self.f.emit(self.b, O::add, Kl, r[1], base.r, r[0]);
+                    base.r = r[1];
+                    parent_ty = inner;
+                }
                 _ => todo!("{:?}", place),
             }
-            parent_ty = ty.projection_ty(self.tcx, it).ty;
         }
         base
     }
@@ -528,7 +568,10 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     fn store_place(&mut self, place: &Place<'tcx>, r: Val) {
         let base = self.addr_place(place);
         match base.kind {
-            ValKind::Scalar | ValKind::Pair => self.emit(O::copy, r.k, base, r, Val::R),
+            ValKind::Scalar | ValKind::Pair => {
+                assert!(base.k == r.k, "{:?}", place);
+                self.emit(O::copy, r.k, base, r, Val::R);
+            },
             ValKind::Memory => {
                 match r.kind {
                     ValKind::Scalar => self.emit(Ferb::store(r.k), Kw, Val::R, r, base),
@@ -558,7 +601,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 r.kind = ValKind::Pair;
             }
             ValKind::Memory => {
-                if ty.is_adt() { return base; }
+                if is_big(ty) { return base; }
                 self.emit(O::load, k, r, base, Val::R);
             }
             ValKind::Undef => todo!("{:?}", place),
@@ -604,7 +647,13 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         let p = self.global_alloc(alloc_id, Size::ZERO, ty);
                         self.create_pair(p, meta)
                     }
-                    _ => todo!("{:?}", operand),
+                    ConstValue::Indirect { alloc_id, offset } => {
+                        let size = self.layout(ty).size.bytes() as i64;
+                        let r = self.alloca(size, ValKind::Memory);
+                        let src = self.global_alloc(alloc_id, offset, ty);
+                        self.f.blit(self.b, r.r, src.r, size as usize);
+                        r
+                    }
                 }
             }
             Operand::RuntimeChecks(it) => {
@@ -687,8 +736,27 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     }
 }
 
+fn tag_load_store(tag: &rustc_abi::Scalar) -> (O, O) {
+    let tag = tag.primitive();
+    use rustc_abi::{Primitive::*, Integer::*};
+    match tag {
+        Int(integer, signed) => match integer {
+            I8 => (if signed { O::loadsb } else { O::loadub }, O::storeb),
+            I16 => (if signed { O::loadsh } else { O::loaduh }, O::storeh),
+            I32 => (if signed { O::loadsw } else { O::loaduw }, O::storew),
+            I64 => (O::load, O::storel),
+            I128 => todo!(),
+        },
+        _ => todo!("{:?}", tag),
+    }
+}
+
+fn is_big(ty: Ty) -> bool {
+    ty.is_adt() || matches!(ty.kind(), TyKind::Tuple(_) | TyKind::Array(_, _))
+}
+
 fn val_cls(ty: Ty) -> (Ferb::Cls, ValKind) {
-    if ty.is_adt() || matches!(ty.kind(), TyKind::Tuple(_)) {
+    if is_big(ty) {
         return (Kl, ValKind::Memory);
     }
     if ty.is_any_ptr() {
@@ -763,8 +831,8 @@ fn get_all_bytes<'tcx>(it: ConstAllocation<'tcx>) -> (&'tcx [u8], Ferb::Seg) {
 }
 
 fn is_wide(ty: Ty) -> bool {
-    if !ty.is_any_ptr() { return false };
-    let inner = ty.builtin_deref(true).unwrap();
+    if !ty.is_any_ptr() || matches!(ty.kind(), TyKind::FnPtr(_, _)){ return false };
+    let inner = ty.builtin_deref(true).unwrap_or_else(|| todo!("{:?}", ty));
     inner.is_str() || inner.is_array_slice()
 }
 

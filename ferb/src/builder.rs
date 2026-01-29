@@ -415,6 +415,27 @@ pub fn store(k: Cls) -> O {
     }
 }
 
+pub fn fix_cmp_cls(op: O, in_k: Cls) -> Option<O> {
+    use O::*;
+    let float_op = match op {
+        ceql => ceqd,
+        cnel => cned,
+        cugel | csgel => cged,
+        cugtl | csgtl => cgtd,
+        culel | cslel => cled,
+        cultl | csltl => cltd,
+        _ => return None,  // precondition for the transmutes
+    };
+    // SAFETY: see franca/backend/ir.fr :OrderMatters
+    Some(match in_k {
+        Cls::Kw => unsafe { std::mem::transmute(op as u32 - 10) },
+        Cls::Kl => op,
+        Cls::Ks => unsafe { std::mem::transmute(float_op as u32 - 8) },
+        Cls::Kd => float_op,
+    })
+}
+
+
 // this exists because you can't call f.emit(_, _, _, f.con(Id::None, 0), _) 
 // because it counts as two mutable references. this lets it work without always adding extra name bindings.
 
