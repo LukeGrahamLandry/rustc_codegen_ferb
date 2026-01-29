@@ -1,7 +1,7 @@
 use rustc_const_eval::interpret::{AllocId, ConstAllocation, GlobalAlloc, Scalar, alloc_range};
 use rustc_hir::def_id::DefId;
 use rustc_index::{Idx, IndexVec, bit_set::MixedBitSet};
-use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}, pretty::MirWriter}, ty::{EarlyBinder, GenericArgsRef, Instance, PseudoCanonicalInput, Ty, TyCtxt, TyKind, TypingEnv, layout::{self, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers, TyAndLayout}}};
+use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}, pretty::MirWriter}, ty::{EarlyBinder, GenericArgsRef, Instance, PseudoCanonicalInput, Ty, TyCtxt, TyKind, TypingEnv, layout::{self, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers, TyAndLayout}, print::with_no_trimmed_paths}};
 use ferb::builder as Ferb;
 use Ferb::Cls::*;
 use Ferb::{J, O, Reflike};
@@ -36,6 +36,8 @@ enum ValKind {
     Undef,
 }
 
+const DEBUG: bool = false;
+
 pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Module {
     let mut m = Ferb::Module::new();
     // TODO: i inline better if they're sorted in callgraph order (def before use)
@@ -49,11 +51,14 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
                 let ret_ty = EarlyBinder::bind(mir.return_ty());
                 let ret_ty = it.instantiate_mir_and_normalize_erasing_regions(tcx, mono, ret_ty);
                 
-                // TODO: sometimes it decides this is an error
-                // let mut buf = Vec::new();
-                // let writer = MirWriter::new(tcx);
-                // writer.write_mir_fn(mir, &mut buf).unwrap();
-                // println!("{}", String::from_utf8_lossy(&buf).into_owned());
+                if DEBUG {
+                    with_no_trimmed_paths! {{  // fixes "diagnostics were expected but none were emitted"
+                        let mut buf = Vec::new();
+                        let writer = MirWriter::new(tcx);
+                        writer.write_mir_fn(mir, &mut buf).unwrap();
+                        eprintln!("{}", String::from_utf8_lossy(&buf).into_owned());
+                    }};
+                }
                 
                 let ret = abi_type(&mut m, tcx, ret_ty);
                 let mut f = Ferb::Func::new(id, ret);
@@ -71,8 +76,7 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
                     start_block,
                     mir,
                 };
-                for i in 0..mir.arg_count {
-                    let local = Local::new(i + 1);
+                for local in mir.args_iter() {
                     let ty = emit.mono_ty(mir.local_decls[local].ty);
                     let repr = abi_type(emit.m, tcx, ty);
                     let (k, kind) = emit.cls(ty);
@@ -93,7 +97,7 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
                     }
                     emit.locals[local] = r;
                 }
-                if cfg!(debug_assertions) { // && tcx.sess.opts.debug_assertions {  // TODO
+                if DEBUG {
                     let loc = tcx.def_span(it.def.def_id());
                     let loc = tcx.sess.source_map().span_to_diagnostic_string(loc.shrink_to_lo());
                     emit.f.comment(emit.m, emit.start_block, &*format!("{}", loc));
@@ -134,7 +138,9 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 // TODO: any other uses of places that take address?
                 if let StatementKind::Assign(box (_, value)) = &it.kind {
                     if let Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) = value {
-                        needs_alloca.insert(place.local);
+                        if !place.is_indirect() {
+                            needs_alloca.insert(place.local);
+                        }
                     }
                 }
             }
@@ -232,7 +238,6 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                                 let r = self.alloca(8, ValKind::Memory);
                                 self.emit(Ferb::store(arg.k), Kw, Val::R, arg, r);
                                 arg = r;
-                                // todo!()
                             }
                             self.f.emit(self.b, O::argc, Kl, (), t, arg.r);
                         }
@@ -244,7 +249,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 }
                 
                 let ret = sig.output();
-                let ret = ret.no_bound_vars().unwrap();
+                let ret = ret.skip_binder();  // discards lifetimes but not generics i hope
                 let ret = self.mono_ty(ret);
                 let ret = abi_type(self.m, self.tcx, ret);
                 match ret {
@@ -317,15 +322,9 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     fn emit_value(&mut self, value: &Rvalue<'tcx>) -> Val {
         match value {
             Rvalue::Use(operand) => self.emit_operand(operand),
-            Rvalue::RawPtr(_, place) => {
-                assert!(place.projection.len() == 1 && place.projection[0].kind() == ProjectionElem::Deref);
+            Rvalue::RawPtr(_, place) | Rvalue::Ref(_, _, place) => {
                 let local = place.local;
-                assert!(self.locals[local].kind != ValKind::Scalar, "{:?}", value);
-                self.locals[local]
-            }
-            Rvalue::Ref(_, _, place) => {
-                let local = place.local;
-                assert!(self.locals[local].kind != ValKind::Scalar, "{:?}", value);
+                assert!(place.is_indirect() || self.locals[local].kind != ValKind::Scalar, "{:?}", value);
                 self.addr_place(place)
             }
             Rvalue::Cast(kind, value, dest_ty) => {
@@ -488,6 +487,10 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         let mut parent_ty = self.mir.local_decls[place.local].ty;
         let mut projection = place.projection.iter();
         if place.projection[0].kind() == ProjectionElem::Deref {
+            parent_ty = match parent_ty.kind() {
+                TyKind::RawPtr(inner, _) | TyKind::Ref(_, inner, _) => *inner,
+                _ => todo!(),
+            };
             projection.next();
         };
         base.kind = ValKind::Memory;

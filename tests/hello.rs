@@ -49,14 +49,19 @@ pub extern "C" fn main() -> usize {
         None => n,
     };
     let foo = (0, twice(t.a).1, "");
-    let value = n - foo.1;
+    let mut value = n - foo.1;
     voidcall();
     if scalar_tuple((0,)) != 3 { return 1; }
-    // for i in 0usize..1usize {
-    //     unsafe { printf("\n\0".as_ptr()) };
-    // }
-    // let _ = (0usize..1usize).next();
+    if dont_skip_deref_layout(&(0, 1)) { return 2 };
+    for i in 0usize..2usize {  // harder than it looks!
+        value += i;
+    }
+    value -= 1;
     return value;
+}
+
+fn dont_skip_deref_layout(foo: &(usize, usize)) -> bool {
+    foo.0 == foo.1
 }
 
 fn voidcall() {}
@@ -72,8 +77,7 @@ fn another(a: usize, b: Thing) -> usize {
 fn scalar_tuple(mut a: (usize,)) -> usize {
     a.0 = 1;
     let b = &mut a;
-    // *(&mut b.0) += 2;
-    b.0 += 2;
+    *(&mut b.0) += 2;
     a.0 
 }
 
@@ -104,6 +108,7 @@ fn panic(_: &PanicInfo) -> ! {
 }
 
 // the humble `for` loop references this if opt-level=0
+// (when using llvm)
 #[lang = "eh_personality"]
 pub fn rust_eh_personality() -> ! {
     unsafe { puts("rust_eh_personality\0".as_ptr()) }; 
