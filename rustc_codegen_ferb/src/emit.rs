@@ -1,7 +1,7 @@
 use rustc_const_eval::interpret::{AllocId, ConstAllocation, GlobalAlloc, Scalar, alloc_range};
 use rustc_hir::def_id::DefId;
 use rustc_index::{Idx, IndexVec, bit_set::MixedBitSet};
-use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}}, ty::{EarlyBinder, GenericArgsRef, Instance, PseudoCanonicalInput, Ty, TyCtxt, TyKind, TypingEnv, layout::{self, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers, TyAndLayout}}};
+use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}, pretty::MirWriter}, ty::{EarlyBinder, GenericArgsRef, Instance, PseudoCanonicalInput, Ty, TyCtxt, TyKind, TypingEnv, layout::{self, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers, TyAndLayout}}};
 use ferb::builder as Ferb;
 use Ferb::Cls::*;
 use Ferb::{J, O, Reflike};
@@ -49,6 +49,12 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
                 let ret_ty = EarlyBinder::bind(mir.return_ty());
                 let ret_ty = it.instantiate_mir_and_normalize_erasing_regions(tcx, mono, ret_ty);
                 
+                // TODO: sometimes it decides this is an error
+                // let mut buf = Vec::new();
+                // let writer = MirWriter::new(tcx);
+                // writer.write_mir_fn(mir, &mut buf).unwrap();
+                // println!("{}", String::from_utf8_lossy(&buf).into_owned());
+                
                 let ret = abi_type(&mut m, tcx, ret_ty);
                 let mut f = Ferb::Func::new(id, ret);
                 let start_block = f.blk();
@@ -67,14 +73,31 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
                 };
                 for i in 0..mir.arg_count {
                     let local = Local::new(i + 1);
-                    let ty = mir.local_decls[local].ty;
+                    let ty = emit.mono_ty(mir.local_decls[local].ty);
+                    let repr = abi_type(emit.m, tcx, ty);
                     let (k, kind) = emit.cls(ty);
                     let mut r = emit.tmp(k);
                     r.kind = kind;
-                    emit.emit(O::par, k, r, Val::R, Val::R);
+                    match repr {
+                        Ferb::Ret::Void => todo!(),
+                        Ferb::Ret::K(kk) => {
+                            assert!(k == kk);
+                            emit.emit(O::par, k, r, Val::R, Val::R)
+                        }
+                        Ferb::Ret::T(t) => {
+                            emit.f.emit(emit.b, O::parc, k, r.r, t, ());
+                            if r.kind == ValKind::Scalar {
+                                r.kind = ValKind::Memory;
+                            }
+                        }
+                    }
                     emit.locals[local] = r;
                 }
-
+                if cfg!(debug_assertions) { // && tcx.sess.opts.debug_assertions {  // TODO
+                    let loc = tcx.def_span(it.def.def_id());
+                    let loc = tcx.sess.source_map().span_to_diagnostic_string(loc.shrink_to_lo());
+                    emit.f.comment(emit.m, emit.start_block, &*format!("{}", loc));
+                }
                 emit.allocate_locals();
                 emit.f.jump(emit.b, J::jmp, (), Some(emit.blocks[BasicBlock::new(0)]), None);
                 emit.emit_return_block(ret);
@@ -117,9 +140,12 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             }
         }
         for (local, it) in self.mir.local_decls.iter_enumerated() {
-            let (k, kind) = self.cls(it.ty);
+            let (k, mut kind) = self.cls(it.ty);
             let size = self.layout(it.ty).size.bytes() as i64;
             let is_arg = self.locals[local].kind != ValKind::Undef;
+            if is_arg {
+                kind = self.locals[local].kind;
+            }
             self.locals[local] = match kind {
                 ValKind::Scalar => if needs_alloca.contains(local) {
                     let r = self.alloca(size, ValKind::Memory);
@@ -185,14 +211,32 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 let callee = self.emit_operand(func);
                 let sig = func.ty(self.mir, self.tcx).fn_sig(self.tcx);
                 let arg_count = sig.inputs().skip_binder().len();
-                let args = args.iter().map(|arg| self.emit_operand(&arg.node)).collect::<Vec<_>>();
-                for (i, arg) in args.iter().enumerate() {
+                let arg_vals = args.iter().map(|arg| self.emit_operand(&arg.node)).collect::<Vec<_>>();
+                for (i, &arg) in arg_vals.iter().enumerate() {
+                    let mut arg = arg;
                     if i == arg_count {
                         assert!(sig.c_variadic());
                         self.f.emit(self.b, O::argv, Kw, (), (), ());
                     }
-                    // TODO: struct abi
-                    self.f.emit(self.b, O::arg, arg.k, (), arg.r, ());
+                    
+                    let ty = self.mono_ty(args[i].node.ty(self.mir, self.tcx));
+                    let repr = abi_type(self.m, self.tcx, ty);
+                    match repr {
+                        Ferb::Ret::Void => todo!(),
+                        Ferb::Ret::K(k) => {
+                            assert!(arg.kind == ValKind::Scalar && arg.k == k);
+                            self.f.emit(self.b, O::arg, arg.k, (), arg.r, ());
+                        }
+                        Ferb::Ret::T(t) => {
+                            if arg.kind == ValKind::Scalar {
+                                let r = self.alloca(8, ValKind::Memory);
+                                self.emit(Ferb::store(arg.k), Kw, Val::R, arg, r);
+                                arg = r;
+                                // todo!()
+                            }
+                            self.f.emit(self.b, O::argc, Kl, (), t, arg.r);
+                        }
+                    }
                 }
                 if sig.c_variadic() && args.len() == arg_count {
                     // wasm cares if variadic even if none passed
@@ -225,11 +269,9 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             TerminatorKind::SwitchInt { discr, targets } => {
                 let discr = self.emit_operand(discr);
                 assert!(discr.kind == ValKind::Scalar);
-                let discr = discr.r;
                 if let Some((val, a, b)) = targets.as_static_if() {
-                    if val == 0 {
-                        // TODO: don't assume Kw
-                        self.f.jump(self.b, J::jnz, discr, Some(self.blocks[b]), Some(self.blocks[a]));
+                    if val == 0 && discr.k == Kw {
+                        self.f.jump(self.b, J::jnz, discr.r, Some(self.blocks[b]), Some(self.blocks[a]));
                         return;
                     }
                 }
@@ -238,7 +280,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 let mut next = self.f.blk();
                 for (&val, &dest) in targets.all_values().iter().zip(targets.all_targets()) {
                     let cond = self.f.tmp();
-                    self.f.emit(self.b, O::ceql, Kl, cond, discr, val.0 as u64);
+                    self.f.emit(self.b, O::ceql, Kl, cond, discr.r, val.0 as u64);
                     self.f.jump(self.b, J::jnz, cond, Some(self.blocks[dest]), Some(next));
                     self.b = next;
                     next = self.f.blk();
@@ -246,11 +288,26 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 self.f.jump(self.b, J::jmp, (), Some(self.blocks[targets.otherwise()]), None);
             }
             TerminatorKind::Unreachable => self.f.jump(self.b, J::hlt, (), None, None),
-            TerminatorKind::Assert { cond, expected, target, .. } => {
+            TerminatorKind::Assert { cond, expected, target, msg, .. } => {
+                // TODO: emit the operands properly and call the panic handler. 
+                // TODO: am i supposed to check cfg here or does that happen in the frontend? 
+                //       (yes, at least for overflow says comment on the enum)
+                let failed = self.f.blk();
+                let msg = format!("{:?}\n\0", msg);  
+                let id = self.m.anon();
+                self.m.data(Ferb::Data {
+                    id,
+                    segment: Ferb::Seg::ConstantData,
+                    template: Ferb::Template::Bytes(msg.as_bytes()),
+                    rel: vec![],
+                });
+                let puts = self.m.intern("puts");
+                self.f.emit(failed, O::arg, Kl, (), id, ());
+                self.f.emit(failed, O::call, Kw, (), puts, ());
+                self.f.jump(failed, J::hlt, (), None, None);
+                
                 let cond = self.emit_operand(cond);
-                let dest = [self.f.blk(), self.blocks[*target]];
-                // TODO: also print the msg.
-                self.f.jump(dest[0], J::hlt, (), None, None);
+                let dest = [failed, self.blocks[*target]];
                 self.f.jump(self.b, J::jnz, cond.r, Some(dest[*expected as usize]), Some(dest[!*expected as usize]));
             }
             _ => todo!("{:?}", terminator),
@@ -285,9 +342,12 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         src
                     }
                     CastKind::IntToInt => {
-                        assert!(dest_ty.primitive_size(self.tcx) == src_ty.primitive_size(self.tcx));
+                        let d = dest_ty.primitive_size(self.tcx).bytes();
+                        let s = src_ty.primitive_size(self.tcx).bytes();
+                        assert!(d == s);
                         src
                     },
+                    CastKind::PointerWithExposedProvenance => src,
                     _ => todo!("{:?}", value),
                 }
             }
@@ -326,6 +386,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     self.f.emit(self.start_block, O::alloc8, Kl, r.r, 16, ());
                     self.emit(op, k, rr, lhs, rhs);
                     self.emit(Ferb::store(k), Kw, Val::R, rr, r);
+                    // TODO: 8/16/128
                     let ok = self.offset(r, Size::from_bytes(if k == Kl || k == Kd { 8 } else { 4 }));  
                     // TODO: do this properly! for now just lying and saying it didn't overflow
                     let zero = self.r(0u64, Kw);  
@@ -425,13 +486,16 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         }
         let mut base = self.locals[place.local];
         let mut parent_ty = self.mir.local_decls[place.local].ty;
-        for it in place.projection.iter() {
+        let mut projection = place.projection.iter();
+        if place.projection[0].kind() == ProjectionElem::Deref {
+            projection.next();
+        };
+        base.kind = ValKind::Memory;
+        for it in projection {
             use ProjectionElem::*;
             match it.kind() {
                 Deref => {
-                    assert!(base.kind == ValKind::Scalar);
-                    base.kind = ValKind::Memory;
-                    return base;  
+                    todo!()
                 }
                 Field(field_idx, ()) => {
                     assert!(matches!(base.kind, ValKind::Memory));
@@ -540,8 +604,9 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     _ => todo!("{:?}", operand),
                 }
             }
-            Operand::RuntimeChecks(_) => {
-                todo!();
+            Operand::RuntimeChecks(it) => {
+                let it = it.value(self.tcx.sess);
+                self.r(it as u64, Kw)
             },
         }
     }

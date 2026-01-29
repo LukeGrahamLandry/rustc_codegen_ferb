@@ -378,6 +378,20 @@ impl Func {
         }
         it
     }
+    
+    pub fn comment(&mut self, m: &mut Module, b: BlkId, msg: &str) {
+        let id = m.intern(msg);
+        if m.sym[id.off as usize].segment == Seg::Invalid {
+            // TODO: this will die if someone tries to use the same thing as a real symbol name later
+            m.data(Data {
+                id,
+                segment: Seg::ConstantData,
+                template: Template::Zeroes(0),
+                rel: vec![],
+            });
+        }
+        self.emit(b, O::dbgloc, Cls::Kw, (), id, Ref::Undef);
+    }
 }
 
 fn field_size(it: FieldType) -> Option<u32> {

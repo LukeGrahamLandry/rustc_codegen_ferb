@@ -26,7 +26,7 @@ pub extern "C" fn main() -> usize {
         BAR.a = n;
         BAR.a
     };
-    if n <= t.a {
+    if n <= t.a && (0 as *const Thing).is_null() {
         unsafe { puts(S); };
     }
     let mut x = 5;
@@ -51,6 +51,11 @@ pub extern "C" fn main() -> usize {
     let foo = (0, twice(t.a).1, "");
     let value = n - foo.1;
     voidcall();
+    if scalar_tuple((0,)) != 3 { return 1; }
+    // for i in 0usize..1usize {
+    //     unsafe { printf("\n\0".as_ptr()) };
+    // }
+    // let _ = (0usize..1usize).next();
     return value;
 }
 
@@ -64,6 +69,15 @@ fn another(a: usize, b: Thing) -> usize {
     t.t.a.wrapping_add(t.t.b).wrapping_add(b.a)
 }
 
+fn scalar_tuple(mut a: (usize,)) -> usize {
+    a.0 = 1;
+    let b = &mut a;
+    // *(&mut b.0) += 2;
+    b.0 += 2;
+    a.0 
+}
+
+#[derive(Copy, Clone)]
 struct Thing {
     a: usize,
     b: usize,
@@ -85,6 +99,7 @@ unsafe extern "C" {
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
+    unsafe { puts("panicked\n\0".as_ptr()) }; 
     loop {}
 }
 

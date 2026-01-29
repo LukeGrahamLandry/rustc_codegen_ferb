@@ -23,9 +23,9 @@ main :: fn() void = {
             "-Z", @tfmt("codegen-backend=target/debug/librustc_codegen_ferb.%", suffix),
             "-C", "panic=abort",
             "-lc",
-            "-Z", "dump-mir= & PreCodegen",
             "-Z", "dump-mir-dir=target/mir_dump",
             "--out-dir", "target",
+            "-Z", "dump-mir= & PreCodegen",
         );
         sh(args);
         ok, out, err := exec_and_catch("./target/hello", empty(), temp()); 
