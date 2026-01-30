@@ -5,7 +5,7 @@ use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, Cons
 use ferb::builder as Ferb;
 use Ferb::Cls::*;
 use Ferb::{J, O, Reflike};
-use rustc_abi::{FieldIdx, FieldsShape, HasDataLayout, Size, TagEncoding, Variants};
+use rustc_abi::{ExternAbi, FieldIdx, FieldsShape, HasDataLayout, Size, TagEncoding, Variants};
 use rustc_span::Span;
 
 struct Emit<'f, 'tcx> {
@@ -220,8 +220,16 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             TerminatorKind::Call { func, args, destination, target, .. } => {
                 let callee = self.emit_operand(func);
                 let sig = func.ty(self.mir, self.tcx).fn_sig(self.tcx);
-                let arg_count = sig.inputs().skip_binder().len();
-                let arg_vals = args.iter().map(|arg| self.emit_operand(&arg.node)).collect::<Vec<_>>();
+                
+                let mut arg_count = sig.inputs().skip_binder().len();
+                let mut arg_vals = args.iter().map(|arg| self.emit_operand(&arg.node)).collect::<Vec<_>>();
+                let mut arg_types = args.iter().map(|arg| self.mono_ty(arg.node.ty(self.mir, self.tcx))).collect::<Vec<_>>();
+                if sig.abi() == ExternAbi::RustCall {
+                    // when calling a closure directly, the args are packed into a tuple but the callee wants them spread. 
+                    assert!(arg_count == 2 && !sig.c_variadic());
+                    self.unpack_direct_closure_args(&mut arg_vals, &mut arg_types);
+                    arg_count = arg_vals.len();
+                }
                 for (i, &arg) in arg_vals.iter().enumerate() {
                     let mut arg = arg;
                     if i == arg_count {
@@ -229,7 +237,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         self.f.emit(self.b, O::argv, Kw, (), (), ());
                     }
                     
-                    let ty = self.mono_ty(args[i].node.ty(self.mir, self.tcx));
+                    let ty = arg_types[i];
                     let repr = abi_type(self.m, self.tcx, ty);
                     match repr {
                         Ferb::Ret::Void => todo!(),
@@ -319,7 +327,38 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 let dest = [failed, self.blocks[*target]];
                 self.f.jump(self.b, J::jnz, cond.r, Some(dest[*expected as usize]), Some(dest[!*expected as usize]));
             }
+            TerminatorKind::Drop { place, target, drop, async_fut, .. } => {
+                assert!(drop.is_none() && async_fut.is_none());
+                // you get one of these even if it does nothing when generic over something without +Copy
+                let _ = place;  // TODO
+                self.f.jump(self.b, J::jmp, (), Some(self.blocks[*target]), None);
+            }
             _ => todo!("{:?}", terminator),
+        }
+    }
+    
+    fn unpack_direct_closure_args(&mut self, arg_vals: &mut Vec<Val>, arg_types: &mut Vec<Ty<'tcx>>) {
+        let base = arg_vals.pop().unwrap();
+        let ty = arg_types.pop().unwrap();
+        let inner = match ty.kind() {
+            TyKind::Tuple(it) => it,
+            _ => todo!(),
+        };
+        
+        let layout = self.layout(ty);
+        for (i, ty) in inner.iter().enumerate() {
+            arg_types.push(ty);
+            let field = self.offset(base, layout.fields.offset(i));
+            let field = match abi_type(self.m, self.tcx, ty) {
+                Ferb::Ret::K(k) => {
+                    let r = self.tmp(k);
+                    self.emit(O::load, k, r, field, Val::R);
+                    r
+                }
+                Ferb::Ret::Void => todo!(),
+                Ferb::Ret::T(_) => field,
+            };
+            arg_vals.push(field);
         }
     }
     
@@ -438,7 +477,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                             layout = layout.for_variant(self, varient);
                         }
                     }
-                    Tuple | Array(_) => (),
+                    Tuple | Array(_) | Closure(_, _) => (),
                     _ => todo!("{:?}", value),
                 }
                 self.emit_aggregate(base, layout, fields);
@@ -621,13 +660,22 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 let (val, ty) = self.finish_const(it);
                 match val {
                     ConstValue::Scalar(it) => {
+                        let ty = operand.ty(self.mir, self.tcx);
                         match it {
                             Scalar::Int(it) => {
-                                let (k, _) = self.cls(operand.ty(self.mir, self.tcx));
+                                let (k, kind) = self.cls(ty);
                                 let raw = it.to_bits(it.size()) as u64;
-                                return self.r(raw, k);
+                                let r = self.r(raw, k);
+                                if kind == ValKind::Memory {
+                                    // i always store tuples in memory but certain opt-level has (0,) as scalar
+                                    let mem = self.alloca(8, kind);
+                                    self.emit(O::storel, Kw, Val::R, r, mem);
+                                    return mem
+                                };
+                                r
                             }
                             Scalar::Ptr(p, _) => {
+                                assert!(!is_big(ty));
                                 let (p, off) = p.prov_and_relative_offset();
                                 self.global_alloc(p.alloc_id(), off, ty)
                             }
@@ -640,6 +688,10 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                                 let id = def_symbol(self.m, self.tcx, def, Some(args));
                                 return self.r(id, Kl);
                             },
+                            &TyKind::Tuple(it) => {
+                                assert!(it.len() == 0, "{:?}", ty);
+                                self.r(0, Kl)
+                            }
                             _ => todo!("zst {:?}", ty)
                         }
                     }
@@ -752,16 +804,16 @@ fn tag_load_store(tag: &rustc_abi::Scalar) -> (O, O) {
 }
 
 fn is_big(ty: Ty) -> bool {
-    ty.is_adt() || matches!(ty.kind(), TyKind::Tuple(_) | TyKind::Array(_, _))
+    matches!(ty.kind(), TyKind::Adt(_, _) | TyKind::Tuple(_) | TyKind::Array(_, _) | TyKind::Closure(_, _))
 }
 
 fn val_cls(ty: Ty) -> (Ferb::Cls, ValKind) {
     if is_big(ty) {
         return (Kl, ValKind::Memory);
     }
-    if ty.is_any_ptr() {
-        return (Kl, if is_wide(ty) { ValKind::Pair } else { ValKind::Scalar });
-    }
+    if is_wide(ty) { return (Kl, ValKind::Pair) }
+    if ty.is_any_ptr() { return (Kl, ValKind::Scalar) }
+
     use rustc_ast::UintTy::*;
     let k = |it| match it {
         U8 | U16 | U32 => Kw,
