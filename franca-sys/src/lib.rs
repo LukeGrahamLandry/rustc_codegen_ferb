@@ -21,13 +21,39 @@ pub struct CompileCmd<'a> {
     pub logging: Slice<'a>,    
     pub p: u64,
     pub m: u64,
-    pub jit: u8,
+    pub arch: Arch,
+    pub os: Os,
+    pub kind: Artifact,
 }
 
 unsafe extern "C" {
     pub fn init_globals() -> Globals;
     pub fn compile_one(fr: Globals, arg: *mut CompileCmd);
     pub fn drop_module(fr: Globals, arg: *mut CompileCmd);
+}
+
+#[repr(i64)]
+pub enum Arch {
+    Arm64,
+    Amd64,
+    Rv64,
+    Wasm32,
+}
+
+#[repr(i64)]
+pub enum Os {
+    Macos,
+    Linux,
+}
+
+#[repr(i64)]
+pub enum Artifact {
+    CachedLate,
+    Jit,
+    Exe,
+    Relocatable,
+    Dynamic,
+    CachedEarly,
 }
 
 impl<'a> From<&'a [u8]> for Slice<'a> {

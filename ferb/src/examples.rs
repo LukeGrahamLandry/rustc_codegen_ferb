@@ -1,5 +1,5 @@
 use franca_sys::*;
-use crate::builder::*;
+use crate::{builder::*, native_target};
 
 #[test]
 fn jit_add() {
@@ -27,6 +27,7 @@ fn jitted(m: Module, name: &[&str], then: impl FnOnce(&[u64])) {
     let bytes = m.finish();
     unsafe {
         let fr = init_globals();
+        let (arch, os) = native_target();
         let mut cmd = CompileCmd {
             frc: Slice::from(&bytes[0..]),
             out: Slice::from("".as_bytes()),
@@ -34,10 +35,13 @@ fn jitted(m: Module, name: &[&str], then: impl FnOnce(&[u64])) {
             logging: Slice::from("".as_bytes()),
             p: 0,
             m: 0,
-            jit: 1,
+            arch,
+            os,
+            kind: Artifact::Jit,
         };
         compile_one(fr, &mut cmd);
         then(&[cmd.p]);
         drop_module(fr, &mut cmd);
     };
 }
+

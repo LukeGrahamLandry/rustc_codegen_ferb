@@ -47,17 +47,19 @@ CompileCmd :: @struct {
     logging: Str;
     p: rawptr;
     m: *Qbe.Module;
-    jit: u8;
+    arch: Arch;
+    os: Os;
+    type: Qbe.OutputPurpose;
 };
 
 fn compile_one(_: *Globals, arg: *CompileCmd) void #export = {
     call_in_stack(*CompileCmd, void, arg, fn(arg) => {
         m := general_allocator().box_zeroed(Qbe.Module);
-        // TODO: pass this in so can cross compile
         Qbe'backend'init_module(m, (
-            type = @if(arg.jit == 0, .Relocatable, .JitOnly), 
-            os = query_current_os(),  
-            arch = query_current_arch(), 
+            type = arg.type, 
+            os = arg.os,  
+            arch = arg.arch, 
+            wrap_entry_for_linux_libc = arg.type == .Exe,
         ));
         m.set_debug_types(arg.logging, true);
         H :: *Qbe.Incremental.Header;
