@@ -5,7 +5,7 @@
 use rustc_const_eval::interpret::{AllocId, ConstAllocation, GlobalAlloc, Scalar, alloc_range};
 use rustc_hir::def_id::DefId;
 use rustc_index::{Idx, IndexVec, bit_set::MixedBitSet};
-use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, NonDivergingIntrinsic, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}, pretty::MirWriter}, ty::{EarlyBinder, GenericArgsRef, Instance, PseudoCanonicalInput, Ty, TyCtxt, TyKind, TypingEnv, adjustment::PointerCoercion, layout::{self, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers, TyAndLayout}, print::with_no_trimmed_paths}};
+use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, NonDivergingIntrinsic, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}, pretty::MirWriter}, ty::{EarlyBinder, GenericArgsRef, Instance, InstanceKind, PseudoCanonicalInput, Ty, TyCtxt, TyKind, TypingEnv, adjustment::PointerCoercion, layout::{self, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers, TyAndLayout}, print::with_no_trimmed_paths}};
 use ferb::builder as Ferb;
 use Ferb::Cls::*;
 use Ferb::{J, O, Reflike};
@@ -42,79 +42,17 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
     for (it, _data) in items {
         match it {
             MonoItem::Fn(it) => {
-                let name = tcx.symbol_name(it).name;
-                let id = m.intern(name);
-                let mir = tcx.instance_mir(it.def);
-                let mono = TypingEnv::fully_monomorphized();
-                let ret_ty = EarlyBinder::bind(mir.return_ty());
-                let ret_ty = it.instantiate_mir_and_normalize_erasing_regions(tcx, mono, ret_ty);
-                
-                if DEBUG {
-                    with_no_trimmed_paths! {{  // fixes "diagnostics were expected but none were emitted"
-                        let mut buf = Vec::new();
-                        let writer = MirWriter::new(tcx);
-                        writer.write_mir_fn(mir, &mut buf).unwrap();
-                        eprintln!("${}();", name);
-                        eprintln!("{}", String::from_utf8_lossy(&buf).into_owned());
-                    }};
-                }
-                
-                let ret = abi_type(&mut m, tcx, ret_ty);
-                let mut f = Ferb::Func::new(id, ret);
-                let start_block = f.blk();
-                let mut emit = Emit {
-                    tcx,
-                    blocks: mir.basic_blocks.iter().map(|_| f.blk()).collect(),
-                    locals: mir.local_decls.iter().map(|_| Placement::NewScalar(Kw)).collect(),
-                    return_block: f.blk(),
-                    b: start_block,
-                    m: &mut m,
-                    f: &mut f,
-                    instance: it,
-                    start_block,
-                    mir,
-                };
-                for local in mir.args_iter() {
-                    let ty = emit.mono_ty(mir.local_decls[local].ty);
-                    let repr = abi_type(emit.m, tcx, ty);
-                    let r = emit.f.tmp();
-                    emit.locals[local] = match repr {
-                        Ferb::Ret::Void => Placement::Scalar(Ferb::Ref::Undef, Kw),
-                        Ferb::Ret::K(k) => {
-                            emit.emit(O::par, k, r, (), ());
-                            Placement::Scalar(r, k)
-                        }
-                        Ferb::Ret::T(t) => {
-                            emit.f.emit(emit.b, O::parc, Kl, r, t, ());
-                            let size = emit.layout(ty).size.bytes_usize();
-                            Placement::Blit(r, size)
-                        }
-                    };
-                }
-                if DEBUG {
-                    let loc = tcx.def_span(it.def.def_id());
-                    let loc = tcx.sess.source_map().span_to_diagnostic_string(loc.shrink_to_lo());
-                    emit.f.comment(emit.m, emit.start_block, &*format!("{}", loc));
-                }
-                emit.allocate_locals();
-                emit.f.jump(emit.b, J::jmp, (), Some(emit.blocks[BasicBlock::new(0)]), None);
-                emit.emit_return_block(ret);
-                
-                for (bid, blk) in mir.basic_blocks.iter_enumerated() {
-                    emit.b = emit.blocks[bid]; 
-                    emit.emit_block(blk);
-                }
-                m.func(f);
+                emit_func(&mut m, tcx, it);
             },
             MonoItem::Static(def) => {
-                let id = def_symbol(&mut m, tcx, def, None);
+                let (id, _) = def_symbol(&mut m, tcx, def, None);
                 let p = tcx.eval_static_initializer(def).unwrap();
-                let (bytes, segment) = get_all_bytes(p);
+                let (bytes, segment, rel) = get_all_bytes(&mut m, tcx, p);
                 m.data(Ferb::Data {
                     id,
                     segment,
                     template: Ferb::Template::Bytes(bytes),
-                    rel: vec![],
+                    rel,
                 });
             },
             MonoItem::GlobalAsm(_) => todo!(),
@@ -122,6 +60,72 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
     }
     
     m
+}
+
+fn emit_func<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>) {
+    let name = tcx.symbol_name(it).name;
+    let id = m.intern(name);
+    let mir = tcx.instance_mir(it.def);
+    let mono = TypingEnv::fully_monomorphized();
+    let ret_ty = EarlyBinder::bind(mir.return_ty());
+    let ret_ty = it.instantiate_mir_and_normalize_erasing_regions(tcx, mono, ret_ty);
+    
+    if DEBUG {
+        with_no_trimmed_paths! {{  // fixes "diagnostics were expected but none were emitted"
+            let mut buf = Vec::new();
+            let writer = MirWriter::new(tcx);
+            writer.write_mir_fn(mir, &mut buf).unwrap();
+            eprintln!("${}();", name);
+            eprintln!("{}", String::from_utf8_lossy(&buf).into_owned());
+        }};
+    }
+    
+    let ret = abi_type(m, tcx, ret_ty);
+    let mut f = Ferb::Func::new(id, ret);
+    let start_block = f.blk();
+    let mut emit = Emit {
+        tcx,
+        blocks: mir.basic_blocks.iter().map(|_| f.blk()).collect(),
+        locals: mir.local_decls.iter().map(|_| Placement::NewScalar(Kw)).collect(),
+        return_block: f.blk(),
+        b: start_block,
+        m,
+        f: &mut f,
+        instance: it,
+        start_block,
+        mir,
+    };
+    for local in mir.args_iter() {
+        let ty = emit.mono_ty(mir.local_decls[local].ty);
+        let repr = abi_type(emit.m, tcx, ty);
+        let r = emit.f.tmp();
+        emit.locals[local] = match repr {
+            Ferb::Ret::Void => Placement::Scalar(Ferb::Ref::Undef, Kw),
+            Ferb::Ret::K(k) => {
+                emit.emit(O::par, k, r, (), ());
+                Placement::Scalar(r, k)
+            }
+            Ferb::Ret::T(t) => {
+                emit.f.emit(emit.b, O::parc, Kl, r, t, ());
+                let size = emit.layout(ty).size.bytes_usize();
+                Placement::Blit(r, size)
+            }
+        };
+    }
+    if DEBUG {
+        let loc = tcx.def_span(it.def.def_id());
+        let loc = tcx.sess.source_map().span_to_diagnostic_string(loc.shrink_to_lo());
+        emit.f.comment(emit.m, emit.start_block, &*format!("{}", loc));
+    }
+    emit.allocate_locals();
+    emit.f.jump(emit.b, J::jmp, (), Some(emit.blocks[BasicBlock::new(0)]), None);
+    emit.emit_return_block(ret);
+    
+    for (bid, blk) in mir.basic_blocks.iter_enumerated() {
+        emit.b = emit.blocks[bid]; 
+        emit.emit_block(blk);
+    }
+    m.func(f);
 }
 
 impl<'f, 'tcx> Emit<'f, 'tcx> {
@@ -213,8 +217,10 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             }
             TerminatorKind::Return => self.f.jump(self.b, J::jmp, (), Some(self.return_block), None),
             TerminatorKind::Call { func, args, destination, target, .. } => {
-                let callee = self.emit_operand(func, Placement::NewScalar(Kl));
-                let sig = func.ty(self.mir, self.tcx).fn_sig(self.tcx);
+                let f_ty = func.ty(self.mir, self.tcx);
+                let f_ty = self.mono_ty(f_ty);
+                let mut callee = self.emit_operand(func, Placement::NewScalar(Kl));
+                let sig = f_ty.fn_sig(self.tcx);
                 
                 let mut arg_count = sig.inputs().skip_binder().len();
                 let mut arg_types = args.iter().map(|arg| abi_type(self.m, self.tcx, self.mono_ty(arg.node.ty(self.mir, self.tcx)))).collect::<Vec<_>>();
@@ -225,10 +231,31 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         Ferb::Ret::T(t) => Placement::NewMemory(self.m.size_of(t)),
                     }))
                     .collect::<Vec<_>>();
-                if sig.abi() == ExternAbi::RustCall {
+                // TODO: not unpacking when dyncall and not replacing arg_vals[0] feels wrong to me? but seems to make it not crash. 
+                let mut dyncall = false;
+                if let &TyKind::FnDef(id, args) = f_ty.kind() {
+                    let (_, instance) = def_symbol(self.m, self.tcx, id, Some(args));
+                    if let InstanceKind::Virtual(_, vtable_index) = instance.def {
+                        assert!(!sig.c_variadic());
+                        let self_arg = arg_vals[0];
+                        let _d_ptr = self.get_pair_slot(self_arg, true);
+                        // arg_vals[0] = d_ptr;
+                        // arg_types[0] = Ferb::Ret::K(Kl);
+                        let v_ptr = self.get_pair_slot(self_arg, false);
+                        // rustc_codegen_ssa::meth::VirtualIndex::get_fn
+                        let vtable_index = vtable_index * self.tcx.data_layout().pointer_size().bytes_usize();
+                        let r = self.f.tmps::<2>();
+                        self.emit(O::add, Kl, r[0], v_ptr, vtable_index);
+                        self.emit(O::load, Kl, r[1], r[0], ());
+                        callee = r[1];
+                        dyncall = true;
+                    }
+                };
+                if sig.abi() == ExternAbi::RustCall && !dyncall {
                     // when calling a closure directly, the args are packed into a tuple but the callee wants them spread. 
                     assert!(arg_count == 2 && !sig.c_variadic());
                     let ty = sig.inputs().skip_binder()[1];
+                    let ty = self.mono_ty(ty);
                     self.unpack_direct_closure_args(&mut arg_vals, &mut arg_types, ty);
                     arg_count = arg_vals.len();
                 }
@@ -482,7 +509,14 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                                         let size = self.emit_scalar(Placement::NewScalar(Kl), size, self.tcx.types.isize);
                                         self.create_pair(dest, src, size)
                                     },
-                                    _ => todo!(),
+                                    TyKind::Closure(_, _) => {
+                                        let TyKind::Dynamic(bound, _) = dest_ty.builtin_deref(true).unwrap().kind() else { todo!("{:?}", dest_ty) };
+                                        let bound = bound.principal().map(|it| self.tcx.instantiate_bound_regions_with_erased(it));
+                                        let id = self.tcx.vtable_allocation((src_ty, bound));
+                                        let id = self.global_alloc(id, Size::from_bytes(0));
+                                        self.create_pair(dest, src, id)
+                                    }
+                                    _ => todo!("{:?}", src_ty),
                                 }
                             }
                             _ => {
@@ -749,7 +783,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         // const known function gets here. the value is stored in the type field. 
                         match ty.kind() {
                             &TyKind::FnDef(def, args) => {
-                                let id = def_symbol(self.m, self.tcx, def, Some(args));
+                                let (id, _) = def_symbol(self.m, self.tcx, def, Some(args));
                                 self.scalar_result(dest, id, Kl)
                             },
                             &TyKind::Tuple(it) => {
@@ -761,12 +795,12 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         }
                     }
                     ConstValue::Slice { alloc_id, meta } => {
-                        let p = self.global_alloc(alloc_id, Size::ZERO, ty);
+                        let p = self.global_alloc(alloc_id, Size::ZERO);
                         self.create_pair(dest, p, meta)
                     }
                     ConstValue::Indirect { alloc_id, offset } => {
                         let size = self.layout(ty).size.bytes_usize();
-                        let src = self.global_alloc(alloc_id, offset, ty);
+                        let src = self.global_alloc(alloc_id, offset);
                         let src = src.r(self.f);
                         self.copy_placement(dest, Placement::Blit(src, size))
                     }
@@ -795,28 +829,8 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         r
     }
     
-    fn global_alloc(&mut self, p: AllocId, off: Size, ty: Ty) -> Ferb::Id<Ferb::Sym> {
-        let p = self.tcx.global_alloc(p);
-        assert_eq!(off.bytes(), 0, "TODO: offset ptr");
-        match p {
-            GlobalAlloc::Memory(it) => {
-                let (bytes, segment) = get_all_bytes(it);
-                assert!(segment == Ferb::Seg::ConstantData, "TODO: need to deduplicate them so you get the same pointer");
-                let id = self.m.anon();
-                self.m.data(Ferb::Data {
-                    id,
-                    segment,
-                    template: Ferb::Template::Bytes(bytes),
-                    rel: vec![],
-                });
-                id
-            }
-            GlobalAlloc::Static(def) => {
-                let id = def_symbol(self.m, self.tcx, def, None);
-                id
-            }
-            _ => todo!("{:?} {:?}", p, ty),
-        }
+    fn global_alloc(&mut self, p: AllocId, off: Size) -> Ferb::Id<Ferb::Sym> {
+        global_alloc(self.m, self.tcx, p, off)
     }
     
     fn alloca(&mut self, size: usize) -> Ferb::Ref {
@@ -859,7 +873,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             Scalar::Ptr(p, _) => {
                 assert!(!is_big(ty));
                 let (p, off) = p.prov_and_relative_offset();
-                let p = self.global_alloc(p.alloc_id(), off, ty);
+                let p = self.global_alloc(p.alloc_id(), off);
                 self.scalar_result(dest, p, Kl)
             }
         }
@@ -938,7 +952,7 @@ fn abi_type<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Ferb
     Ferb::Ret::T(t)
 }
 
-fn def_symbol<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, def: DefId, args: Option<GenericArgsRef<'tcx>>) -> Ferb::Id<Ferb::Sym> {
+fn def_symbol<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, def: DefId, args: Option<GenericArgsRef<'tcx>>) -> (Ferb::Id<Ferb::Sym>, Instance<'tcx>) {
     let span = tcx.def_span(def);
     let mono = TypingEnv::fully_monomorphized();
     let instance = match args {
@@ -946,26 +960,59 @@ fn def_symbol<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, def: DefId, args: O
         None => Instance::mono(tcx, def),
     };
     let id = m.intern(tcx.symbol_name(instance).name);
-    id
+    (id, instance)
 }
 
-fn get_all_bytes<'tcx>(it: ConstAllocation<'tcx>) -> (&'tcx [u8], Ferb::Seg) {
+fn global_alloc<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, p: AllocId, off: Size) -> Ferb::Id<Ferb::Sym> {
+    let p = tcx.global_alloc(p);
+    assert_eq!(off.bytes(), 0, "TODO: offset ptr");
+    match p {
+        GlobalAlloc::Memory(it) => {
+            let (bytes, segment, rel) = get_all_bytes(m, tcx, it);
+            assert!(segment == Ferb::Seg::ConstantData, "TODO: need to deduplicate them so you get the same pointer");
+            let id = m.anon();
+            m.data(Ferb::Data {
+                id,
+                segment,
+                template: Ferb::Template::Bytes(bytes),
+                rel,
+            });
+            id
+        }
+        GlobalAlloc::Static(def) => {
+            def_symbol(m, tcx, def, None).0
+        }
+        GlobalAlloc::Function { instance } => {
+            // TODO: is it ok that things are referenced here that we don't emit? i don't think so. 
+            //       but then how do we decide if it's in the other list too?
+            emit_func(m, tcx, instance);
+            let name = tcx.symbol_name(instance).name;
+            m.intern(name)
+        }
+        _ => todo!("{:?}", p),
+    }
+}
+
+fn get_all_bytes<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: ConstAllocation<'tcx>) -> (&'tcx [u8], Ferb::Seg, Vec<Ferb::Reloc>) {
     let it = it.inner();
-    assert!(it.provenance().provenances().next().is_none(), "TODO: rel");
+    let rel = it.provenance().ptrs().iter().map(|(off, id)| {
+        let id = global_alloc(m, tcx, id.alloc_id(), Size::from_bytes(0)); 
+        Ferb::Reloc { addend: 0, off: off.bytes() as u32, id }
+    }).collect::<Vec<_>>();
     let range = alloc_range(Size::from_bytes(0), it.size());
     use rustc_ast::Mutability::*;
     let seg = match it.mutability {
         Not => Ferb::Seg::ConstantData,
         Mut => Ferb::Seg::MutableData,
     };
-    (it.get_bytes_unchecked(range), seg)
+    (it.get_bytes_unchecked(range), seg, rel)
 }
 
 fn is_wide(ty: Ty) -> bool {
     assert!(!matches!(ty.kind(), TyKind::Param(_)));
     if !ty.is_any_ptr() || matches!(ty.kind(), TyKind::FnPtr(_, _)){ return false };
     let inner = ty.builtin_deref(true).unwrap_or_else(|| todo!("{:?}", ty));
-    inner.is_str() || inner.is_array_slice()
+    inner.is_str() || inner.is_array_slice() || inner.is_trait()
 }
 
 fn choose_op(op: BinOp, signed: bool) -> Ferb::O {
