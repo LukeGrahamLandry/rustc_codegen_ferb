@@ -79,7 +79,7 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
                     let repr = abi_type(emit.m, tcx, ty);
                     let r = emit.f.tmp();
                     emit.locals[local] = match repr {
-                        Ferb::Ret::Void => todo!(),
+                        Ferb::Ret::Void => Placement::Scalar(Ferb::Ref::Undef, Kw),
                         Ferb::Ret::K(k) => {
                             emit.emit(O::par, k, r, (), ());
                             Placement::Scalar(r, k)
@@ -240,7 +240,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     
                     let repr = arg_types[i];
                     match repr {
-                        Ferb::Ret::Void => todo!(),
+                        Ferb::Ret::Void => continue,
                         Ferb::Ret::K(k) => {
                             self.f.emit(self.b, O::arg, k, (), r, ());
                         }
@@ -420,9 +420,10 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 }
             }
             Rvalue::Cast(kind, value, dest_ty) => {
-                let src = self.new_placement(value.ty(self.mir, self.tcx));
-                let src = self.emit_operand(value, src);
                 let src_ty = value.ty(&self.mir.local_decls, self.tcx);
+                let src_ty = self.mono_ty(src_ty);
+                let src = self.new_placement(src_ty);
+                let src = self.emit_operand(value, src);
                 match kind {
                     CastKind::Transmute => {
                         if is_wide(src_ty) {
@@ -471,9 +472,24 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         self.scalar_result(dest, src, Kl)
                     },
                     CastKind::PointerCoercion(kind, _)  => {
-                        assert!(!matches!(kind, PointerCoercion::ClosureFnPointer(_) | PointerCoercion::Unsize));
-                        assert!(!is_wide(*dest_ty));  // TODO
-                        self.scalar_result(dest, src, Kl)
+                        match kind {
+                            PointerCoercion::ClosureFnPointer(_) => todo!(),
+                            PointerCoercion::Unsize => {
+                                match src_ty.builtin_deref(true).unwrap().kind() {
+                                    TyKind::Array(_, size) => {
+                                        assert!(dest_ty.is_array_slice());
+                                        let size = size.try_to_scalar().unwrap_or_else(|| todo!("{:?}", size));
+                                        let size = self.emit_scalar(Placement::NewScalar(Kl), size, self.tcx.types.isize);
+                                        self.create_pair(dest, src, size)
+                                    },
+                                    _ => todo!(),
+                                }
+                            }
+                            _ => {
+                                assert!(!is_wide(*dest_ty));  // TODO
+                                self.scalar_result(dest, src, Kl)
+                            },
+                        }
                     },
                     _ => todo!("{:?}", value),
                 }
@@ -503,6 +519,13 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 let out_ty = value.ty(self.mir, self.tcx);
                 let (lhs, rhs) = (self.emit_operand(lhs, Placement::NewScalar(in_k)), self.emit_operand(rhs, Placement::NewScalar(in_k)));
                 let k = self.cls(out_ty).0;
+                if op == &BinOp::Offset {
+                    assert!(!is_wide(in_ty));
+                    let inner = in_ty.builtin_deref(true).unwrap();
+                    let r = self.step_pointer(lhs, rhs, inner);
+                    return self.scalar_result(dest, r, k);
+                }
+                                
                 if let Some(op) = (*op).overflowing_to_wrapping() {
                     let r = self.get_memory(dest);
                     let op = choose_op(op, in_ty.is_signed());
@@ -528,7 +551,6 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             Rvalue::Aggregate(kind, fields) => {
                 use rustc_middle::mir::AggregateKind::*;
                 let ty = value.ty(self.mir, self.tcx);
-                assert!(is_big(ty));
                 let mut layout = self.layout(ty);
                 let base = self.get_memory(dest);
                 match **kind {
@@ -545,7 +567,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         }
                     }
                     Tuple | Array(_) | Closure(_, _) => (),
-                    _ => todo!("{:?}", value),
+                    _ => assert!(is_wide(ty), "{:?}", value),
                 }
                 self.emit_aggregate(base, layout, fields);
                 assert!(matches!(dest, Placement::Blit(_, _) | Placement::NewMemory(_)));
@@ -621,6 +643,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             };
             projection.next();
         };
+        // note: is_wide: &[T] vs Slice: [T]. can be unsized because place is already a pointer. 
         for it in projection {
             use ProjectionElem::*;
             match it {
@@ -648,22 +671,37 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 },
                 Index(index) => {
                     let Placement::Scalar(index, _) = self.locals[index] else { todo!() };
-                    let inner = match parent_ty.kind() {
-                        TyKind::Array(it, _) => *it,
-                        _ => todo!(),
+                    let (inner, p) = match parent_ty.kind() {
+                        &TyKind::Array(inner, _) => (inner, base),
+                        &TyKind::Slice(inner) => (inner, self.get_pair_slot(base, true)),
+                        _ => todo!("{:?}", parent_ty),
                     };
-                    let layout = self.layout(inner);
-                    let step = layout.size.bytes();
-                    let r = self.f.tmps::<2>();
-                    self.f.emit(self.b, O::mul, Kl, r[0], index, step);
-                    self.f.emit(self.b, O::add, Kl, r[1], base, r[0]);
-                    base = r[1];
+                    base = self.step_pointer(p, index, inner);
+                    parent_ty = inner;
+                }
+                ConstantIndex { offset, from_end, .. } => {
+                    assert!(!from_end, "{:?}", place);  // TODO
+                    let inner = match parent_ty.kind() {
+                        &TyKind::Slice(inner) => inner,
+                        _ => todo!(), 
+                    };
+                    let p = self.get_pair_slot(base, true);
+                    base = self.step_pointer(p, offset, inner);
                     parent_ty = inner;
                 }
                 _ => todo!("{:?}", place),
             }
         }
         Placement::Blit(base, final_size)
+    }
+    
+    fn step_pointer(&mut self, base: Ferb::Ref, index: impl Reflike, inner: Ty<'tcx>) -> Ferb::Ref {
+        let layout = self.layout(inner);
+        let step = layout.size.bytes();
+        let r = self.f.tmps::<2>();
+        self.f.emit(self.b, O::mul, Kl, r[0], index, step);
+        self.f.emit(self.b, O::add, Kl, r[1], base, r[0]);
+        r[1]
     }
     
     fn load_place(&mut self, dest: Placement, place: &Place<'tcx>) -> Ferb::Ref {
@@ -705,19 +743,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 match val {
                     ConstValue::Scalar(it) => {
                         let ty = operand.ty(self.mir, self.tcx);
-                        match it {
-                            Scalar::Int(it) => {
-                                let (k, _) = self.cls(ty);
-                                let raw = it.to_bits(it.size()) as u64;
-                                self.scalar_result(dest, raw, k)
-                            }
-                            Scalar::Ptr(p, _) => {
-                                assert!(!is_big(ty));
-                                let (p, off) = p.prov_and_relative_offset();
-                                let p = self.global_alloc(p.alloc_id(), off, ty);
-                                self.scalar_result(dest, p, Kl)
-                            }
-                        }
+                        self.emit_scalar(dest, it, ty)
                     }
                     ConstValue::ZeroSized => {
                         // const known function gets here. the value is stored in the type field. 
@@ -730,6 +756,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                                 assert!(it.len() == 0, "{:?}", ty);
                                 self.scalar_result(dest, Ferb::Ref::Undef, Kl)
                             }
+                            TyKind::Adt(_, _) => self.scalar_result(dest, Ferb::Ref::Undef, Kl),
                             _ => todo!("zst {:?}", ty)
                         }
                     }
@@ -820,6 +847,22 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     
     pub fn emit(&mut self, o: O, k: Ferb::Cls, to: impl Reflike, a0: impl Reflike, a1: impl Reflike) {
         self.f.emit(self.b, o, k, to, a0, a1);
+    }
+
+    fn emit_scalar(&mut self, dest: Placement, it: Scalar, ty: Ty<'tcx>) -> Ferb::Ref {
+        match it {
+            Scalar::Int(it) => {
+                let (k, _) = self.cls(ty);
+                let raw = it.to_bits(it.size()) as u64;
+                self.scalar_result(dest, raw, k)
+            }
+            Scalar::Ptr(p, _) => {
+                assert!(!is_big(ty));
+                let (p, off) = p.prov_and_relative_offset();
+                let p = self.global_alloc(p.alloc_id(), off, ty);
+                self.scalar_result(dest, p, Kl)
+            }
+        }
     }
 }
 
@@ -919,6 +962,7 @@ fn get_all_bytes<'tcx>(it: ConstAllocation<'tcx>) -> (&'tcx [u8], Ferb::Seg) {
 }
 
 fn is_wide(ty: Ty) -> bool {
+    assert!(!matches!(ty.kind(), TyKind::Param(_)));
     if !ty.is_any_ptr() || matches!(ty.kind(), TyKind::FnPtr(_, _)){ return false };
     let inner = ty.builtin_deref(true).unwrap_or_else(|| todo!("{:?}", ty));
     inner.is_str() || inner.is_array_slice()
