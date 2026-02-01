@@ -7,17 +7,16 @@ use rustc_hir::def_id::DefId;
 use rustc_index::{Idx, IndexVec, bit_set::MixedBitSet};
 use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, NonDivergingIntrinsic, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}, pretty::MirWriter}, ty::{EarlyBinder, GenericArgsRef, Instance, InstanceKind, PseudoCanonicalInput, Ty, TyCtxt, TyKind, TypingEnv, adjustment::PointerCoercion, layout::{self, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers, TyAndLayout}, print::with_no_trimmed_paths}};
 use ferb::builder as Ferb;
-use Ferb::Cls::*;
-use Ferb::{J, O, Reflike};
+use Ferb::{J, O, Reflike, Cls::*};
 use rustc_abi::{ExternAbi, FieldIdx, FieldsShape, HasDataLayout, Size, TagEncoding, Variants};
-use rustc_span::{Span, sym};
+use rustc_span::Span;
 
 const DEBUG: bool = false;
 
-struct Emit<'f, 'tcx> {
-    tcx: TyCtxt<'tcx>,
-    m: &'f mut Ferb::Module,
-    f: &'f mut Ferb::Func,
+pub(crate) struct Emit<'f, 'tcx> {
+    pub(crate) tcx: TyCtxt<'tcx>,
+    pub(crate) m: &'f mut Ferb::Module,
+    pub(crate) f: &'f mut Ferb::Func,
     b: Ferb::BlkId,
     blocks: IndexVec<BasicBlock, Ferb::BlkId>,
     locals: IndexVec<Local, Placement>,
@@ -28,7 +27,7 @@ struct Emit<'f, 'tcx> {
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]
-enum Placement {
+pub(crate) enum Placement {
     NewScalar(Ferb::Cls),
     Scalar(Ferb::Ref, Ferb::Cls),
     Blit(Ferb::Ref, usize),
@@ -245,24 +244,10 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     let dest = self.addr_place(place);
                     let _ = self.emit_value(value, dest);
                 },
-                StatementKind::Nop => (),
-                StatementKind::StorageLive(_) => (),
-                StatementKind::StorageDead(_) => (),
+                StatementKind::Nop | StatementKind::StorageLive(_) | StatementKind::StorageDead(_) => (),
                 StatementKind::Intrinsic(box it) => match it {
                     NonDivergingIntrinsic::Assume(_) => (),  // not my department
-                    NonDivergingIntrinsic::CopyNonOverlapping(it) => {
-                        let (dest, src, size) = (
-                            self.emit_operand(&it.dst, Placement::NewScalar(Kl)),
-                            self.emit_operand(&it.src, Placement::NewScalar(Kl)),
-                            self.emit_operand(&it.count, Placement::NewScalar(Kl)),
-                        );
-                        // TODO: if const size: self.f.blit(self.b, dest, src, size);
-                        let id = self.m.intern("memcpy");
-                        self.emit(O::arg, Kl, (), dest, ());
-                        self.emit(O::arg, Kl, (), src, ());
-                        self.emit(O::arg, Kl, (), size, ());
-                        self.emit(O::call, Kw, (), id, ());
-                    }
+                    NonDivergingIntrinsic::CopyNonOverlapping(it) => self.call_memcpy(it),
                 }
                 _ => todo!("{:?}", stmt),
             }
@@ -304,58 +289,19 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         emit_func(self.m, self.tcx, instance);
                     };
                     
-                    if let InstanceKind::Intrinsic(def) = instance.def {
-                        let intrinsic = self.tcx.item_name(def);
-                        // TODO: how do i know if it's one that can be ignored? 
-                        //       `black_box` is linker error if i don't do it here but `write_bytes` is fine to emit a real call
-                        match intrinsic {
-                            sym::black_box => {
-                                // TODO: do a #no_inline that escapes the address so it's actually a black_box to opt
-                                assert!(arg_count == 1);
-                                let result = match arg_types[0] {
-                                    Ferb::Ret::K(k) => Placement::Scalar(arg_vals[0], k),
-                                    Ferb::Ret::Void => Placement::Zst,
-                                    Ferb::Ret::T(t) => Placement::Blit(arg_vals[0], self.m.size_of(t)),
-                                };
-                                self.copy_placement(dest, result);
+                    match instance.def {
+                        InstanceKind::Intrinsic(def) => {
+                            assert!(!sig.c_variadic());
+                            if self.call_intrinsic(dest, &arg_vals, def, sig.inputs().skip_binder()) {
                                 self.f.jump(self.b, j, (), target, None);
                                 return;
                             }
-                            sym::ctpop => {  // CounT POPulation
-                                assert!(arg_count == 1);
-                                let r = self.scalar_dest(dest);
-                                let (k, _) = self.cls(sig.input(0).skip_binder());
-                                self.emit(O::ones, k, r, arg_vals[0], ());
-                                self.scalar_result(dest, r, k);
-                                self.f.jump(self.b, j, (), target, None);
-                                return;
-                            }
-                            sym::write_bytes => {
-                                let id = self.m.intern("memset");
-                                let (dest, value, size) = (arg_vals[0], arg_vals[1], arg_vals[2]);
-                                self.emit(O::arg, Kl, (), dest, ());
-                                self.emit(O::arg, Kl, (), value, ());
-                                self.emit(O::arg, Kl, (), size, ());
-                                self.emit(O::call, Kw, (), id, ());
-                                self.f.jump(self.b, j, (), target, None);
-                                return;
-                            }
-                            _ => ()
                         }
-                    }
-                    if let InstanceKind::Virtual(_, vtable_index) = instance.def {
-                        assert!(!sig.c_variadic());
-                        let self_arg = arg_vals[0];
-                        let d_ptr = self.get_pair_slot(self_arg, true);
-                        arg_types[0] = Ferb::Ret::K(Kl);  // TODO?
-                        arg_vals[0] = d_ptr;
-                        let v_ptr = self.get_pair_slot(self_arg, false);
-                        // rustc_codegen_ssa::meth::VirtualIndex::get_fn
-                        let vtable_index = vtable_index * self.tcx.data_layout().pointer_size().bytes_usize();
-                        let r = self.f.tmps::<2>();
-                        self.emit(O::add, Kl, r[0], v_ptr, vtable_index);
-                        self.emit(O::load, Kl, r[1], r[0], ());
-                        callee = r[1];
+                        InstanceKind::Virtual(_, vtable_index) => {
+                            assert!(!sig.c_variadic());
+                            callee = self.load_trait_object(&mut arg_vals[0], &mut arg_types[0], vtable_index);
+                        }
+                        _ => ()
                     }
                 };
                 if sig.abi() == ExternAbi::RustCall {
@@ -427,25 +373,11 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 }
                 self.f.jump(self.b, J::jmp, (), Some(self.blocks[targets.otherwise()]), None);
             }
-            TerminatorKind::Unreachable => self.f.jump(self.b, J::hlt, (), None, None),
             TerminatorKind::Assert { cond, expected, target, msg, .. } => {
-                // TODO: emit the operands properly and call the panic handler. 
                 // TODO: am i supposed to check cfg here or does that happen in the frontend? 
                 //       (yes, at least for overflow says comment on the enum)
                 let failed = self.f.blk();
-                let msg = format!("{:?}\n\0", msg);  
-                let id = self.m.anon();
-                self.m.data(Ferb::Data {
-                    id,
-                    segment: Ferb::Seg::ConstantData,
-                    template: Ferb::Template::Bytes(msg.as_bytes()),
-                    rel: vec![],
-                });
-                let puts = self.m.intern("puts");
-                self.f.emit(failed, O::arg, Kl, (), id, ());
-                self.f.emit(failed, O::call, Kw, (), puts, ());
-                self.f.jump(failed, J::hlt, (), None, None);
-                
+                self.call_panic(failed, msg);
                 let cond = self.emit_operand(cond, Placement::NewScalar(Kw));
                 let dest = [failed, self.blocks[*target]];
                 self.f.jump(self.b, J::jnz, cond, Some(dest[*expected as usize]), Some(dest[!*expected as usize]));
@@ -456,6 +388,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 let _ = place;  // TODO
                 self.f.jump(self.b, J::jmp, (), Some(self.blocks[*target]), None);
             }
+            TerminatorKind::Unreachable |
             TerminatorKind::UnwindTerminate { .. } | TerminatorKind::UnwindResume { .. } => 
                 self.f.jump(self.b, J::hlt, (), None, None),  // TODO
             _ => todo!("{:?}", terminator),
@@ -465,10 +398,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     fn unpack_direct_closure_args(&mut self, arg_vals: &mut Vec<Ferb::Ref>, arg_types: &mut Vec<Ferb::Ret>, ty: Ty<'tcx>) {
         let base = arg_vals.pop().unwrap();
         let _ = arg_types.pop().unwrap();
-        let inner = match ty.kind() {
-            TyKind::Tuple(it) => it,
-            _ => todo!(),
-        };
+        let TyKind::Tuple(inner) = ty.kind() else { todo!("{:?}", ty) };
         
         let layout = self.layout(ty);
         for (i, ty) in inner.iter().enumerate() {
@@ -488,7 +418,20 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         }
     }
     
-    fn scalar_dest(&mut self, dest: Placement) -> Ferb::Ref {
+    fn load_trait_object(&mut self, self_arg: &mut Ferb::Ref, self_type: &mut Ferb::Ret, vtable_index: usize) -> Ferb::Ref {
+        let d_ptr = self.get_pair_slot(*self_arg, true);
+        let v_ptr = self.get_pair_slot(*self_arg, false);
+        // rustc_codegen_ssa::meth::VirtualIndex::get_fn
+        let vtable_index = vtable_index * self.tcx.data_layout().pointer_size().bytes_usize();
+        let r = self.f.tmps::<2>();
+        self.emit(O::add, Kl, r[0], v_ptr, vtable_index);
+        self.emit(O::load, Kl, r[1], r[0], ());
+        *self_arg = d_ptr;
+        *self_type = Ferb::Ret::K(Kl);  // TODO?
+        r[1]
+    }
+    
+    pub(crate) fn scalar_dest(&mut self, dest: Placement) -> Ferb::Ref {
         match dest {
             Placement::Zst => Ferb::Ref::Undef,
             Placement::NewScalar(_) => self.f.tmp(),
@@ -500,7 +443,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         }
     }
     
-    fn scalar_result(&mut self, dest: Placement, r: impl Reflike, k: Ferb::Cls) -> Ferb::Ref {
+    pub(crate) fn scalar_result(&mut self, dest: Placement, r: impl Reflike, k: Ferb::Cls) -> Ferb::Ref {
         let r = r.r(self.f);
         match dest {
             Placement::Zst => Ferb::Ref::Undef,
@@ -799,7 +742,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         // note: is_wide: &[T] vs Slice: [T]. can be unsized because place is already a pointer. 
         for it in projection {
             use ProjectionElem::*;
-            match it {
+            (parent_ty, base) = match it {
                 Deref => unreachable!(),  // only allowed as first projection
                 Field(field_idx, inner) => {
                     use FieldsShape::*;
@@ -809,8 +752,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         Primitive => return Placement::Blit(base, final_size),
                         _ => todo!("{:?}", place),
                     };
-                    base = self.offset(base, offsets[field_idx]);
-                    parent_ty = inner;
+                    (inner, self.offset(base, offsets[field_idx]))
                 }
                 Downcast(_, varient) => {
                     let layout = self.layout(parent_ty);
@@ -819,8 +761,8 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     };
                     let layout = layout.for_variant(self, varient);
                     let first = layout.layout.fields.index_by_increasing_offset().next().unwrap();
-                    base = self.offset(base, layout.fields.offset(first));
-                    parent_ty = ty.projection_ty(self.tcx, it).ty;
+                    let inner = ty.projection_ty(self.tcx, it).ty;
+                    (inner, self.offset(base, layout.fields.offset(first)))
                 },
                 Index(index) => {
                     let Placement::Scalar(index, _) = self.locals[index] else { todo!() };
@@ -829,8 +771,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         &TyKind::Slice(inner) => (inner, self.get_pair_slot(base, true)),
                         _ => todo!("{:?}", parent_ty),
                     };
-                    base = self.step_pointer(p, index, inner);
-                    parent_ty = inner;
+                    (inner, self.step_pointer(p, index, inner))
                 }
                 ConstantIndex { offset, from_end, .. } => {
                     assert!(!from_end, "{:?}", place);  // TODO
@@ -839,11 +780,10 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         _ => todo!(), 
                     };
                     let p = self.get_pair_slot(base, true);
-                    base = self.step_pointer(p, offset, inner);
-                    parent_ty = inner;
+                    (inner, self.step_pointer(p, offset, inner))
                 }
                 _ => todo!("{:?}", place),
-            }
+            };
         }
         Placement::Blit(base, final_size)
     }
@@ -859,12 +799,10 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     
     fn load_place(&mut self, dest: Placement, place: &Place<'tcx>) -> Ferb::Ref {
         let src = self.addr_place(place);
-        let rr = self.copy_placement(dest, src);
-        // eprintln!("load_place {:?} = {:?} = {:?} = {:?}", dest, place, src, rr);
-        rr
+        self.copy_placement(dest, src)
     }
     
-    fn copy_placement(&mut self, dest: Placement, src: Placement,) -> Ferb::Ref {
+    pub(crate) fn copy_placement(&mut self, dest: Placement, src: Placement,) -> Ferb::Ref {
         match src {
             Placement::NewScalar(_) | Placement::NewMemory(_) => unreachable!(),
             Placement::Scalar(r, k) => self.scalar_result(dest, r, k),
@@ -889,7 +827,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         }
     }
     
-    fn emit_operand(&mut self, operand: &Operand<'tcx>, dest: Placement) -> Ferb::Ref {
+   pub(crate) fn emit_operand(&mut self, operand: &Operand<'tcx>, dest: Placement) -> Ferb::Ref {
         match operand {
             Operand::Copy(place) => self.load_place(dest, place),
             Operand::Move(place) => self.load_place(dest, place),
@@ -961,7 +899,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         r
     }
     
-    fn cls(&self, ty: Ty<'tcx>) -> (Ferb::Cls, ()) {
+    pub(crate) fn cls(&self, ty: Ty<'tcx>) -> (Ferb::Cls, ()) {
         let ty = self.mono_ty(ty);
         val_cls(ty)
     }
@@ -1001,7 +939,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         }
     }
     
-    fn abi_type(&mut self, ty: Ty<'tcx>) -> Ferb::Ret {
+    pub(crate) fn abi_type(&mut self, ty: Ty<'tcx>) -> Ferb::Ret {
         let ty = self.mono_ty(ty);
         abi_type(self.m, self.tcx, ty)
     }

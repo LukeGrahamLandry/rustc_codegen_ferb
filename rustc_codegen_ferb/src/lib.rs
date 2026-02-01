@@ -42,6 +42,7 @@ extern crate rustc_driver;
 
 mod emit;
 mod extra;
+mod intrinsic;
 
 pub struct FerbCodegenBackend {}
 
