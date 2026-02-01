@@ -20,7 +20,7 @@ main :: fn() void = {
         exe := @tfmt("./target/%", file.slice(0, file.len - 3)); 
         
         // run it once with llvm to make sure my test program is correct
-        args := @slice("rustc", src, "-lc", "--out-dir", "target");
+        args := @slice("rustc", src, "-lc", "--out-dir", "target", "-C", "panic=abort");
         expected, _ := compile_and_run(args, exe);
         @println("=== % output % bytes ===", file, expected.len);
         
@@ -47,6 +47,9 @@ main :: fn() void = {
 }
 
 compile_and_run :: fn(args: []Str, exe: Str) Ty([]u8, []u8) = {
+    // make sure not cheating with an old one if it fails to write the executable
+    _ := Syscall'remove(exe.as_cstr());  
+
     sh(args);
     ok, out, err := exec_and_catch(exe, empty(), temp()); 
     o, e := (out.items(), err.items());

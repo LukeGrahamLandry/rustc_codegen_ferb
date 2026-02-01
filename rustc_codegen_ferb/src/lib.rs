@@ -1,7 +1,7 @@
 #![feature(rustc_private)]
 #![feature(box_patterns)]
 
-use std::any::Any;
+use std::{any::Any, fs::Permissions, os::unix::fs::PermissionsExt};
 
 use rustc_codegen_ssa::{
     CodegenResults, CompiledModule, CrateInfo, ModuleKind, TargetConfig, back::{archive::ArArchiveBuilderBuilder, link::link_binary}, traits::CodegenBackend
@@ -41,6 +41,7 @@ extern crate rustc_target;
 extern crate rustc_driver;
 
 mod emit;
+mod extra;
 
 pub struct FerbCodegenBackend {}
 
@@ -49,6 +50,7 @@ pub struct OngoingCodegen {
     cgu_name: String,
     m: Ferb::Module,
     need_linker: bool,
+    allocator: Option<CompiledModule>,
 }
 
 impl CodegenBackend for FerbCodegenBackend {
@@ -72,6 +74,8 @@ impl CodegenBackend for FerbCodegenBackend {
             let outputs = &tcx.output_filenames(()).outputs;
             have_imports || !(outputs.len() == 1 && outputs.contains_key(&OutputType::Exe))
         };
+        let allocator = extra::allocator_module(tcx);
+        assert!(allocator.is_none() || need_linker);
         
         let m = crate::emit::emit(tcx, &cgus[0]);
         Box::new(OngoingCodegen {
@@ -79,6 +83,7 @@ impl CodegenBackend for FerbCodegenBackend {
             cgu_name: cgus[0].name().as_str().into(),
             m,
             need_linker,
+            allocator,
         })
     }
 
@@ -103,22 +108,16 @@ impl CodegenBackend for FerbCodegenBackend {
         // TODO: use threaded *CodegenShared from franca/backend/lib.fr instead of building up the whole module first
         let obj = unsafe { ferb::compile_aot(&worker.m.finish(), logging, arch, os, artifact) };
         std::fs::write(&output_file, obj).unwrap();
-
-        let result = CompiledModule {
-            name: worker.cgu_name,
-            kind: ModuleKind::Regular,
-            object: if worker.need_linker { Some(output_file) } else { None },
-            dwarf_object: None,
-            bytecode: None,
-            assembly: None,
-            llvm_ir: None,
-            links_from_incr_cache: vec![],
+        if ty == OutputType::Exe {
+            std::fs::set_permissions(&output_file, Permissions::from_mode(0o777)).unwrap();
         };
-
+        
+        let object = if worker.need_linker { Some(output_file) } else { None };
+        let result = compiled_module(worker.cgu_name, ModuleKind::Regular, object);
         let work_products = FxIndexMap::default();
         (
             CodegenResults {
-                allocator_module: None,
+                allocator_module: worker.allocator,
                 crate_info: worker.crate_info,
                 modules: vec![result],
             },
@@ -153,6 +152,14 @@ impl CodegenBackend for FerbCodegenBackend {
         if need_linker {
             link_binary(sess, &ArArchiveBuilderBuilder, codegen_results, metadata, outputs, self.name());
         }
+    }
+}
+
+fn compiled_module(name: String, kind: ModuleKind, object: Option<std::path::PathBuf>) -> CompiledModule {
+    CompiledModule {
+        name, kind, object,
+        dwarf_object: None, bytecode: None, assembly: None, llvm_ir: None,
+        links_from_incr_cache: vec![],
     }
 }
 

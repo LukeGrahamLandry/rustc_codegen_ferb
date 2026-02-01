@@ -10,7 +10,7 @@ use ferb::builder as Ferb;
 use Ferb::Cls::*;
 use Ferb::{J, O, Reflike};
 use rustc_abi::{ExternAbi, FieldIdx, FieldsShape, HasDataLayout, Size, TagEncoding, Variants};
-use rustc_span::Span;
+use rustc_span::{Span, sym};
 
 const DEBUG: bool = false;
 
@@ -33,6 +33,7 @@ enum Placement {
     Scalar(Ferb::Ref, Ferb::Cls),
     Blit(Ferb::Ref, usize),
     NewMemory(usize),
+    Zst,
 }
 
 pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Module {
@@ -58,7 +59,7 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
             MonoItem::GlobalAsm(_) => todo!(),
         } 
     }
-    
+    crate::extra::maybe_create_entry_wrapper(&mut m, tcx, cgu);
     m
 }
 
@@ -86,7 +87,7 @@ fn emit_func<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>) 
     let mut emit = Emit {
         tcx,
         blocks: mir.basic_blocks.iter().map(|_| f.blk()).collect(),
-        locals: mir.local_decls.iter().map(|_| Placement::NewScalar(Kw)).collect(),
+        locals: mir.local_decls.iter().map(|_| Placement::Zst).collect(),
         return_block: f.blk(),
         b: start_block,
         m,
@@ -95,12 +96,15 @@ fn emit_func<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>) 
         start_block,
         mir,
     };
-    for local in mir.args_iter() {
+    
+    let count = if mir.spread_arg.is_some() { 1 } else { mir.arg_count };
+    for local in 1..count+1 {
+        let local = Local::new(local);
         let ty = emit.mono_ty(mir.local_decls[local].ty);
-        let repr = abi_type(emit.m, tcx, ty);
+        let repr = emit.abi_type(ty);
         let r = emit.f.tmp();
         emit.locals[local] = match repr {
-            Ferb::Ret::Void => Placement::Scalar(Ferb::Ref::Undef, Kw),
+            Ferb::Ret::Void => Placement::Zst,
             Ferb::Ret::K(k) => {
                 emit.emit(O::par, k, r, (), ());
                 Placement::Scalar(r, k)
@@ -111,6 +115,45 @@ fn emit_func<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>) 
                 Placement::Blit(r, size)
             }
         };
+    }
+    
+    // inverse of unpack_direct_closure_args
+    if let Some(args_tuple) = mir.spread_arg {
+        assert!(mir.arg_count == 2 && args_tuple.as_u32() == 2);
+
+        let ty = mir.local_decls[Local::new(2)].ty;
+        let ty = emit.mono_ty(ty);
+        let TyKind::Tuple(inner) = ty.kind() else { todo!("{:?}", ty) };
+        
+        let mut arg_vals = vec![];
+        for ty in inner.iter() {
+            let ty = emit.abi_type(ty);
+            let r = emit.f.tmp();
+            match ty {
+                Ferb::Ret::K(k) => emit.emit(O::par, k, r, (), ()),
+                Ferb::Ret::Void => (),
+                Ferb::Ret::T(t) => emit.emit(O::parc, Kl, r, t, ()),
+            };
+            arg_vals.push(r);
+        }
+        
+        let layout = emit.layout(ty);
+        let size = layout.size.bytes_usize();
+        let base = emit.alloca(size);
+        emit.locals[args_tuple] = Placement::Blit(base, size);
+        for (i, ty) in inner.iter().enumerate() {
+            let ty = emit.abi_type(ty);
+            let field = emit.offset(base, layout.fields.offset(i));
+            let r = arg_vals[i];
+            match ty {
+                Ferb::Ret::K(k) => emit.emit(Ferb::store(k), Kw, (), r, field),
+                Ferb::Ret::Void => (),
+                Ferb::Ret::T(t) => emit.f.blit(emit.b, r, field, emit.m.size_of(t)),
+            };
+        }
+        if size == 0 {
+            emit.locals[args_tuple] = Placement::Zst;
+        }
     }
     if DEBUG {
         let loc = tcx.def_span(it.def.def_id());
@@ -147,6 +190,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             let ty = self.mono_ty(it.ty);
             let (k, _) = self.cls(ty);
             let size = self.layout(ty).size.bytes_usize();
+            if size == 0 { continue };
             let is_arg = local.index() != 0 && local.index() < self.mir.arg_count + 1;
             if is_arg { 
                 if needs_alloca.contains(local) {
@@ -159,6 +203,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 continue;
             }
             
+            assert!(matches!(self.locals[local], Placement::Zst));
             if is_wide(ty) || is_big(ty) || needs_alloca.contains(local) {
                 let dest = self.alloca(size);
                 self.locals[local] = Placement::Blit(dest, size);
@@ -176,6 +221,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             return;
         }
         let r = match self.locals[RETURN_PLACE] {
+            Placement::Zst => Ferb::Ref::Null,
             Placement::Blit(r, _) | Placement::Scalar(r, _) => r,
             Placement::NewScalar(_) | Placement::NewMemory(_) => unreachable!(),
         };
@@ -189,7 +235,6 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             Ferb::Ret::Void => J::ret0,
             Ferb::Ret::T(_) => J::retc,
         };
-        let r = if ret != Ferb::Ret::Void { r } else { Ferb::Ref::Null };
         self.f.jump(self.b, j, r, None, None);
     }
     
@@ -205,7 +250,19 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 StatementKind::StorageDead(_) => (),
                 StatementKind::Intrinsic(box it) => match it {
                     NonDivergingIntrinsic::Assume(_) => (),  // not my department
-                    NonDivergingIntrinsic::CopyNonOverlapping { .. } => todo!(),
+                    NonDivergingIntrinsic::CopyNonOverlapping(it) => {
+                        let (dest, src, size) = (
+                            self.emit_operand(&it.dst, Placement::NewScalar(Kl)),
+                            self.emit_operand(&it.src, Placement::NewScalar(Kl)),
+                            self.emit_operand(&it.count, Placement::NewScalar(Kl)),
+                        );
+                        // TODO: if const size: self.f.blit(self.b, dest, src, size);
+                        let id = self.m.intern("memcpy");
+                        self.emit(O::arg, Kl, (), dest, ());
+                        self.emit(O::arg, Kl, (), src, ());
+                        self.emit(O::arg, Kl, (), size, ());
+                        self.emit(O::call, Kw, (), id, ());
+                    }
                 }
                 _ => todo!("{:?}", stmt),
             }
@@ -217,13 +274,17 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             }
             TerminatorKind::Return => self.f.jump(self.b, J::jmp, (), Some(self.return_block), None),
             TerminatorKind::Call { func, args, destination, target, .. } => {
+                let dest = self.addr_place(destination);
+                let j = target.map(|_| J::jmp).unwrap_or(J::hlt);
+                let target = target.map(|it| self.blocks[it]);
+                
                 let f_ty = func.ty(self.mir, self.tcx);
                 let f_ty = self.mono_ty(f_ty);
                 let mut callee = self.emit_operand(func, Placement::NewScalar(Kl));
                 let sig = f_ty.fn_sig(self.tcx);
                 
                 let mut arg_count = sig.inputs().skip_binder().len();
-                let mut arg_types = args.iter().map(|arg| abi_type(self.m, self.tcx, self.mono_ty(arg.node.ty(self.mir, self.tcx)))).collect::<Vec<_>>();
+                let mut arg_types = args.iter().map(|arg| self.abi_type(arg.node.ty(self.mir, self.tcx))).collect::<Vec<_>>();
                 let mut arg_vals = args.iter().zip(&arg_types)
                     .map(|(arg, &repr)| self.emit_operand(&arg.node, match repr {
                         Ferb::Ret::K(k) => Placement::NewScalar(k),
@@ -231,16 +292,63 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         Ferb::Ret::T(t) => Placement::NewMemory(self.m.size_of(t)),
                     }))
                     .collect::<Vec<_>>();
-                // TODO: not unpacking when dyncall and not replacing arg_vals[0] feels wrong to me? but seems to make it not crash. 
-                let mut dyncall = false;
-                if let &TyKind::FnDef(id, args) = f_ty.kind() {
-                    let (_, instance) = def_symbol(self.m, self.tcx, id, Some(args));
+                if let &TyKind::FnDef(id, generics) = f_ty.kind() {
+                    let (_, instance) = def_symbol(self.m, self.tcx, id, Some(generics));
+                    
+                    // TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
+                    // how am i supposed to get this one on the list??
+                    // but also it's only a problem on macos so maybe it's something about weak symbols 
+                    // and this entry in the vtable isn't actually called. 
+                    let hack = "_RNvXs0_NtNtNtCs5KxHkbnNOyA_4core3ops8function5implsRNCINvNtCs4LOHw96cXq6_3std2rt10lang_startuE0INtB7_6FnOnceuE9call_onceCs8HFjjLcntvV_12custom_alloc";
+                    if self.tcx.symbol_name(instance).name == hack {
+                        emit_func(self.m, self.tcx, instance);
+                    };
+                    
+                    if let InstanceKind::Intrinsic(def) = instance.def {
+                        let intrinsic = self.tcx.item_name(def);
+                        // TODO: how do i know if it's one that can be ignored? 
+                        //       `black_box` is linker error if i don't do it here but `write_bytes` is fine to emit a real call
+                        match intrinsic {
+                            sym::black_box => {
+                                // TODO: do a #no_inline that escapes the address so it's actually a black_box to opt
+                                assert!(arg_count == 1);
+                                let result = match arg_types[0] {
+                                    Ferb::Ret::K(k) => Placement::Scalar(arg_vals[0], k),
+                                    Ferb::Ret::Void => Placement::Zst,
+                                    Ferb::Ret::T(t) => Placement::Blit(arg_vals[0], self.m.size_of(t)),
+                                };
+                                self.copy_placement(dest, result);
+                                self.f.jump(self.b, j, (), target, None);
+                                return;
+                            }
+                            sym::ctpop => {  // CounT POPulation
+                                assert!(arg_count == 1);
+                                let r = self.scalar_dest(dest);
+                                let (k, _) = self.cls(sig.input(0).skip_binder());
+                                self.emit(O::ones, k, r, arg_vals[0], ());
+                                self.scalar_result(dest, r, k);
+                                self.f.jump(self.b, j, (), target, None);
+                                return;
+                            }
+                            sym::write_bytes => {
+                                let id = self.m.intern("memset");
+                                let (dest, value, size) = (arg_vals[0], arg_vals[1], arg_vals[2]);
+                                self.emit(O::arg, Kl, (), dest, ());
+                                self.emit(O::arg, Kl, (), value, ());
+                                self.emit(O::arg, Kl, (), size, ());
+                                self.emit(O::call, Kw, (), id, ());
+                                self.f.jump(self.b, j, (), target, None);
+                                return;
+                            }
+                            _ => ()
+                        }
+                    }
                     if let InstanceKind::Virtual(_, vtable_index) = instance.def {
                         assert!(!sig.c_variadic());
                         let self_arg = arg_vals[0];
-                        let _d_ptr = self.get_pair_slot(self_arg, true);
-                        // arg_vals[0] = d_ptr;
-                        // arg_types[0] = Ferb::Ret::K(Kl);
+                        let d_ptr = self.get_pair_slot(self_arg, true);
+                        arg_types[0] = Ferb::Ret::K(Kl);  // TODO?
+                        arg_vals[0] = d_ptr;
                         let v_ptr = self.get_pair_slot(self_arg, false);
                         // rustc_codegen_ssa::meth::VirtualIndex::get_fn
                         let vtable_index = vtable_index * self.tcx.data_layout().pointer_size().bytes_usize();
@@ -248,10 +356,9 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         self.emit(O::add, Kl, r[0], v_ptr, vtable_index);
                         self.emit(O::load, Kl, r[1], r[0], ());
                         callee = r[1];
-                        dyncall = true;
                     }
                 };
-                if sig.abi() == ExternAbi::RustCall && !dyncall {
+                if sig.abi() == ExternAbi::RustCall {
                     // when calling a closure directly, the args are packed into a tuple but the callee wants them spread. 
                     assert!(arg_count == 2 && !sig.c_variadic());
                     let ty = sig.inputs().skip_binder()[1];
@@ -265,8 +372,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         self.f.emit(self.b, O::argv, Kw, (), (), ());
                     }
                     
-                    let repr = arg_types[i];
-                    match repr {
+                    match arg_types[i] {
                         Ferb::Ret::Void => continue,
                         Ferb::Ret::K(k) => {
                             self.f.emit(self.b, O::arg, k, (), r, ());
@@ -283,9 +389,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 
                 let ret = sig.output();
                 let ret = ret.skip_binder();  // discards lifetimes but not generics i hope
-                let ret = self.mono_ty(ret);
-                let ret = abi_type(self.m, self.tcx, ret);
-                let dest = self.addr_place(destination);
+                let ret = self.abi_type(ret);
                 match ret {
                     Ferb::Ret::K(k) => {
                         let r = self.scalar_dest(dest);
@@ -300,8 +404,6 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         self.f.blit(self.b, r, rr, size);  // :SLOW
                     }
                 }
-                let j = target.map(|_| J::jmp).unwrap_or(J::hlt);
-                let target = target.map(|it| self.blocks[it]);
                 self.f.jump(self.b, j, (), target, None);
             }
             TerminatorKind::SwitchInt { discr, targets } => {
@@ -354,6 +456,8 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 let _ = place;  // TODO
                 self.f.jump(self.b, J::jmp, (), Some(self.blocks[*target]), None);
             }
+            TerminatorKind::UnwindTerminate { .. } | TerminatorKind::UnwindResume { .. } => 
+                self.f.jump(self.b, J::hlt, (), None, None),  // TODO
             _ => todo!("{:?}", terminator),
         }
     }
@@ -368,7 +472,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         
         let layout = self.layout(ty);
         for (i, ty) in inner.iter().enumerate() {
-            let ty = abi_type(self.m, self.tcx, ty);
+            let ty = self.abi_type(ty);
             arg_types.push(ty);
             let field = self.offset(base, layout.fields.offset(i));
             let field = match ty {
@@ -386,6 +490,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     
     fn scalar_dest(&mut self, dest: Placement) -> Ferb::Ref {
         match dest {
+            Placement::Zst => Ferb::Ref::Undef,
             Placement::NewScalar(_) => self.f.tmp(),
             Placement::Scalar(dest, _) => dest,
             Placement::Blit(_, size) | Placement::NewMemory(size) => {
@@ -398,6 +503,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     fn scalar_result(&mut self, dest: Placement, r: impl Reflike, k: Ferb::Cls) -> Ferb::Ref {
         let r = r.r(self.f);
         match dest {
+            Placement::Zst => Ferb::Ref::Undef,
             Placement::NewScalar(_) => r,
             Placement::Scalar(dest, k) => {
                 if dest != r {
@@ -423,12 +529,17 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             Placement::NewScalar(_) | Placement::Scalar(_, _) => todo!(),
             Placement::Blit(dest, _) => dest,
             Placement::NewMemory(size) => self.alloca(size),
+            Placement::Zst => Ferb::Ref::Undef,
         }
     }
     
     fn new_placement(&mut self, ty: Ty<'tcx>) -> Placement {
+        let size = self.layout(ty).size.bytes_usize();
+        if size == 0 && !matches!(ty.kind(), TyKind::FnDef(_, _)) {
+            return Placement::Zst;
+        }
         if is_big(ty) || is_wide(ty) {
-            return Placement::NewMemory(self.layout(ty).size.bytes_usize())
+            return Placement::NewMemory(size)
         }
         let (k, _) = self.cls(ty);
         Placement::NewScalar(k)
@@ -439,7 +550,11 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             Rvalue::Use(operand) => self.emit_operand(operand, dest),
             Rvalue::RawPtr(_, place) | Rvalue::Ref(_, _, place) => {
                 let place = self.addr_place(place);
-                let Placement::Blit(r, _) = place else { todo!() }; 
+                let r = match place {
+                    Placement::Blit(r, _) => r,
+                    Placement::Zst => return self.scalar_result(dest, Ferb::Ref::Undef, Kl),
+                    _ => todo!("{:?}", place),
+                };
                 if is_wide(value.ty(self.mir, self.tcx)) {
                     self.copy_placement(dest, place)
                 } else {
@@ -449,8 +564,8 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             Rvalue::Cast(kind, value, dest_ty) => {
                 let src_ty = value.ty(&self.mir.local_decls, self.tcx);
                 let src_ty = self.mono_ty(src_ty);
-                let src = self.new_placement(src_ty);
-                let src = self.emit_operand(value, src);
+                let src_place = self.new_placement(src_ty);
+                let src = self.emit_operand(value, src_place);
                 match kind {
                     CastKind::Transmute => {
                         if is_wide(src_ty) {
@@ -514,7 +629,10 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                                         let bound = bound.principal().map(|it| self.tcx.instantiate_bound_regions_with_erased(it));
                                         let id = self.tcx.vtable_allocation((src_ty, bound));
                                         let id = self.global_alloc(id, Size::from_bytes(0));
-                                        self.create_pair(dest, src, id)
+                                        assert!(src_ty.is_any_ptr());  //  &Closure
+                                        let data = self.alloca(8);     // &&Closure
+                                        self.emit(O::storel, Kw, (), src, data);
+                                        self.create_pair(dest, data, id)  // &dyn Fn()
                                     }
                                     _ => todo!("{:?}", src_ty),
                                 }
@@ -665,6 +783,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         }
         let final_size = self.layout(ty.ty).size.bytes_usize();
         let mut base = match self.locals[place.local] {
+            Placement::Zst => return Placement::Zst,
             Placement::NewScalar(_) | Placement::NewMemory(_) => todo!(),
             Placement::Scalar(r, _) | Placement::Blit(r, _) => r,
         };
@@ -764,7 +883,9 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     dest
                 },
                 Placement::NewMemory(_) => src,
+                Placement::Zst => Ferb::Ref::Undef,
             },
+            Placement::Zst => Ferb::Ref::Undef,
         }
     }
     
@@ -784,6 +905,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         match ty.kind() {
                             &TyKind::FnDef(def, args) => {
                                 let (id, _) = def_symbol(self.m, self.tcx, def, Some(args));
+                                assert!(dest != Placement::Zst);
                                 self.scalar_result(dest, id, Kl)
                             },
                             &TyKind::Tuple(it) => {
@@ -878,6 +1000,11 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             }
         }
     }
+    
+    fn abi_type(&mut self, ty: Ty<'tcx>) -> Ferb::Ret {
+        let ty = self.mono_ty(ty);
+        abi_type(self.m, self.tcx, ty)
+    }
 }
 
 fn tag_load_store<'tcx>(tcx: TyCtxt<'tcx>, tag: &rustc_abi::Scalar) -> (O, O, Ty<'tcx>) {
@@ -935,24 +1062,30 @@ fn layout_of<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>) -> TyAndLayout<'tcx> {
 
 fn abi_type<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Ferb::Ret {
     let (k, _) = val_cls(ty);
+    let layout = layout_of(tcx, ty);
+    let size = layout.size.bytes_usize();
+    if size == 0 {
+        return Ferb::Ret::Void;
+    }
     if !is_big(ty) && !is_wide(ty) {
         return Ferb::Ret::K(k);
-    }
-    let layout = layout_of(tcx, ty);
-    if layout.size.bytes() == 0 {
-        return Ferb::Ret::Void;
     }
     // TODO: proper abi
     let t = m.typ(Ferb::TypeLayout {
         align: layout.align.bytes_usize(),
-        size: layout.size.bytes_usize(),
-        cases: vec![],
+        size,
+        cases: match size {
+            1 => vec![vec![Ferb::Field::Scalar(Ferb::FieldType::Fb)]],
+            8 => vec![vec![Ferb::Field::Scalar(Ferb::FieldType::Fl)]],
+            16 => vec![vec![Ferb::Field::Scalar(Ferb::FieldType::Fl), Ferb::Field::Scalar(Ferb::FieldType::Fl)]],
+            _ => vec![],
+        },
         is_union: false,
     });
     Ferb::Ret::T(t)
 }
 
-fn def_symbol<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, def: DefId, args: Option<GenericArgsRef<'tcx>>) -> (Ferb::Id<Ferb::Sym>, Instance<'tcx>) {
+pub(crate) fn def_symbol<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, def: DefId, args: Option<GenericArgsRef<'tcx>>) -> (Ferb::Id<Ferb::Sym>, Instance<'tcx>) {
     let span = tcx.def_span(def);
     let mono = TypingEnv::fully_monomorphized();
     let instance = match args {

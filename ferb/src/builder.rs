@@ -135,8 +135,8 @@ impl Module {
             });
         }
         
+        debug_assert_eq!(self.sym[id].segment, Seg::Invalid, "redeclared {:?} {:?}", id, self.name_of(f.id));
         let sym = &mut self.sym[id];
-        debug_assert_eq!(sym.segment, Seg::Invalid, "redeclared {:?}", id);
         sym.segment = Seg::Code;
         sym.payload.fnc = Fnc {
             reg: 0,
@@ -305,6 +305,12 @@ impl Module {
         assert!(t.0 & 0b111 == 3);  // ::RType
         let t = t.0 as usize >> 3;
         self.typ[t].size as usize
+    }
+    
+    pub fn name_of(&self, id: Id<Sym>) -> &str {
+        let sym = &self.sym[id.off as usize];
+        let bytes = &self.str[sym.name.off as usize..sym.name.off as usize + sym.name.count as usize];
+        str::from_utf8(bytes).unwrap()
     }
 }
 
