@@ -6,4 +6,5 @@ see the `tests` folder for programs it can compile so far (you will not be impre
 ## thank you for information
 
 - https://github.com/rust-lang/rustc_codegen_cranelift
+- https://github.com/rust-lang/rust/tree/main/compiler/rustc_codegen_ssa
 - https://rustc-dev-guide.rust-lang.org/part-5-intro.html

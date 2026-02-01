@@ -60,6 +60,7 @@ fn compile_one(_: *Globals, arg: *CompileCmd) void #export = {
             os = arg.os,  
             arch = arg.arch, 
             wrap_entry_for_linux_libc = arg.type == .Exe,
+            exe_debug_symbol_table = true,
         ));
         m.set_debug_types(arg.logging, true);
         H :: *Qbe.Incremental.Header;

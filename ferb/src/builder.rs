@@ -300,6 +300,12 @@ impl Module {
     pub fn anon(&mut self) -> Id<Sym> {
         self.sym(&*format!("__R{}", self.sym.len()))
     }
+
+    pub fn size_of(&self, t: Ref) -> usize {
+        assert!(t.0 & 0b111 == 3);  // ::RType
+        let t = t.0 as usize >> 3;
+        self.typ[t].size as usize
+    }
 }
 
 impl Func {
@@ -363,9 +369,10 @@ impl Func {
         b.s = [s1, s2];
     }
     
-    pub fn blit(&mut self, b: BlkId, dest: Ref, src: Ref, n: usize) {
+    pub fn blit(&mut self, b: BlkId, dest: impl Reflike, src: impl Reflike, n: usize) {
         debug_assert!(n < (1 << 29), "blit too large");
         let n = pack_ref(RefKind::RInt, n as u32);
+        let (dest, src) = (dest.r(self), src.r(self));
         self.emit(b, O::blit0, Cls::Kw, Ref::Null, src, dest);
         self.emit(b, O::blit1, Cls::Kw, Ref::Null, n, Ref::Null);
     }
@@ -460,6 +467,11 @@ impl Reflike for i64 {
 impl Reflike for u64 {
     fn r(self, f: &mut Func) -> Ref {
         i64::from_ne_bytes(self.to_ne_bytes()).r(f)
+    }
+}
+impl Reflike for usize {
+    fn r(self, f: &mut Func) -> Ref {
+        (self as u64).r(f)
     }
 }
 impl Reflike for i32 {
