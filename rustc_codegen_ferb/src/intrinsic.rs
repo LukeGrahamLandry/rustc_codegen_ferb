@@ -65,6 +65,14 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 self.emit(O::arg, Kl, (), size, ());
                 self.emit(O::call, Kw, (), id, ());
             }
+            sym::size_of_val => {
+                let size = self.layout(inputs[0]).size.bytes();
+                self.scalar_result(dest, size, Kl);
+            }
+            sym::align_of_val => {
+                let size = self.layout(inputs[0]).align.bytes();
+                self.scalar_result(dest, size, Kl);
+            }
             _ => return false,
         }
         true

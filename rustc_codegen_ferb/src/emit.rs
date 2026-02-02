@@ -17,7 +17,7 @@ pub(crate) struct Emit<'f, 'tcx> {
     pub(crate) tcx: TyCtxt<'tcx>,
     pub(crate) m: &'f mut Ferb::Module,
     pub(crate) f: &'f mut Ferb::Func,
-    b: Ferb::BlkId,
+    pub(crate) b: Ferb::BlkId,
     blocks: IndexVec<BasicBlock, Ferb::BlkId>,
     locals: IndexVec<Local, Placement>,
     instance: Instance<'tcx>,
@@ -273,7 +273,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 let mut arg_vals = args.iter().zip(&arg_types)
                     .map(|(arg, &repr)| self.emit_operand(&arg.node, match repr {
                         Ferb::Ret::K(k) => Placement::NewScalar(k),
-                        Ferb::Ret::Void => Placement::NewScalar(Kw),  // ehh...
+                        Ferb::Ret::Void => Placement::Zst,
                         Ferb::Ret::T(t) => Placement::NewMemory(self.m.size_of(t)),
                     }))
                     .collect::<Vec<_>>();
@@ -495,23 +495,28 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 let place = self.addr_place(place);
                 let r = match place {
                     Placement::Blit(r, _) => r,
-                    Placement::Zst => return self.scalar_result(dest, Ferb::Ref::Undef, Kl),
+                    Placement::Zst => return Ferb::Ref::Undef,
                     _ => todo!("{:?}", place),
                 };
-                if is_wide(value.ty(self.mir, self.tcx)) {
-                    self.copy_placement(dest, place)
-                } else {
-                    self.scalar_result(dest, r, Kl)
-                }
+                self.ptr_result(dest, r, value.ty(self.mir, self.tcx))
             }
             Rvalue::Cast(kind, value, dest_ty) => {
+                let dest_ty = self.mono_ty(*dest_ty);
                 let src_ty = value.ty(&self.mir.local_decls, self.tcx);
                 let src_ty = self.mono_ty(src_ty);
                 let src_place = self.new_placement(src_ty);
                 let src = self.emit_operand(value, src_place);
                 match kind {
                     CastKind::Transmute => {
-                        if is_wide(src_ty) {
+                        // HACK: i repr all structs in memory
+                        let to_big = is_big(dest_ty) || is_wide(dest_ty);
+                        let from_big = is_big(src_ty) || is_wide(src_ty);
+                        if from_big {
+                            if !to_big {
+                                let r = self.f.tmp();
+                                self.emit(O::load, Kl, r, src, ());
+                                return self.scalar_result(dest, r, Kl)
+                            }
                             match dest {
                                 Placement::Blit(dest, size) => {
                                     self.f.blit(self.b, dest, src, size);
@@ -521,18 +526,22 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                                 _ => todo!(),
                             }
                         } else {
-                            self.scalar_result(dest, src, Kl)
+                            if to_big {
+                                let r = self.get_memory(dest);
+                                self.emit(Ferb::store(Kl), Kw, (), src, r);
+                                return r;
+                            }
+                            return self.scalar_result(dest, src, Kl);
                         }
                     },
                     CastKind::PtrToPtr => {
                         assert!(src_ty.is_any_ptr() && dest_ty.is_any_ptr());
-                        if is_wide(src_ty) && !is_wide(*dest_ty) {
+                        if is_wide(src_ty) && !is_wide(dest_ty) {
                             let r = self.get_pair_slot(src, true);
                             return self.scalar_result(dest, r, Kl)
                         }
-                        assert!(is_wide(src_ty) == is_wide(*dest_ty));
-                        assert!(!is_wide(src_ty)); // TODO: blit
-                        self.scalar_result(dest, src, Kl)
+                        assert!(is_wide(src_ty) == is_wide(dest_ty));
+                        self.ptr_result(dest, src, src_ty)
                     }
                     CastKind::IntToInt => {
                         let d = dest_ty.primitive_size(self.tcx).bytes();
@@ -552,8 +561,9 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         self.emit(o, k, r, src, ());
                         self.scalar_result(dest, r, k)
                     },
+                    CastKind::PointerExposeProvenance |
                     CastKind::PointerWithExposedProvenance => {
-                        assert!(!is_wide(*dest_ty));  // TODO
+                        assert!(!is_wide(dest_ty));  // TODO
                         self.scalar_result(dest, src, Kl)
                     },
                     CastKind::PointerCoercion(kind, _)  => {
@@ -581,12 +591,12 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                                 }
                             }
                             _ => {
-                                assert!(!is_wide(*dest_ty));  // TODO
+                                assert!(!is_wide(dest_ty));  // TODO
                                 self.scalar_result(dest, src, Kl)
                             },
                         }
                     },
-                    _ => todo!("{:?}", value),
+                    _ => todo!("{:?} {:?}", value, kind),
                 }
             }
             Rvalue::UnaryOp(op, value) => {
@@ -651,8 +661,8 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 match **kind {
                     Adt(_, varient, _, _, active) => {
                         assert!(active.is_none(), "TODO: union");
-                        if let Variants::Multiple { tag_encoding, tag_field, tag, .. } = &layout.variants {
-                            assert!(layout.fields.count() == 1 && tag_encoding == &TagEncoding::Direct);
+                        // TODO: is it in the fields if its niche?
+                        if let Variants::Multiple { tag_encoding: TagEncoding::Direct, tag_field, tag, .. } = &layout.variants {
                             let value = varient.as_u32() as u64;
                             let (_, o, ty) = tag_load_store(self.tcx, tag);
                             let dest = self.offset_placement(base, layout, *tag_field, ty);
@@ -674,14 +684,16 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 let ty = place.ty(self.mir, self.tcx);
                 let layout = self.layout(ty.ty);
                 if let Variants::Multiple { tag_encoding, tag_field, tag, .. } = &layout.variants {
-                    assert!(layout.fields.count() == 1 && tag_encoding == &TagEncoding::Direct);
                     let base = self.get_memory(base);
                     let (o, _, ty) = tag_load_store(self.tcx, tag);
                     let base = self.offset_placement(base, layout, *tag_field, ty);
                     let Placement::Blit(base, _) = base else { todo!() };
                     let r = self.scalar_dest(dest);
                     self.emit(o, Kl, r, base, ());
-                    return self.scalar_result(dest, r, Kl);
+                    match tag_encoding {
+                        TagEncoding::Direct => return self.scalar_result(dest, r, Kl),
+                        TagEncoding::Niche { .. } => return self.get_niche(dest, r, layout),
+                    }
                 }
                 todo!("discriminant {:?}", place)
             }
@@ -689,7 +701,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         }
     }
     
-    fn layout(&self, ty: Ty<'tcx>) -> TyAndLayout<'tcx> {
+    pub(crate) fn layout(&self, ty: Ty<'tcx>) -> TyAndLayout<'tcx> {
         let ty = self.mono_ty(ty);
         self.layout_of(ty)
     }
@@ -756,9 +768,6 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 }
                 Downcast(_, varient) => {
                     let layout = self.layout(parent_ty);
-                    if let Variants::Multiple { tag_encoding, .. } = &layout.variants {
-                        assert!(tag_encoding == &TagEncoding::Direct);
-                    };
                     let layout = layout.for_variant(self, varient);
                     let first = layout.layout.fields.index_by_increasing_offset().next().unwrap();
                     let inner = ty.projection_ty(self.tcx, it).ty;
@@ -943,6 +952,15 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         let ty = self.mono_ty(ty);
         abi_type(self.m, self.tcx, ty)
     }
+
+    fn ptr_result(&mut self, dest: Placement, src: Ferb::Ref, src_ty: Ty<'tcx>) -> Ferb::Ref {
+        assert!(src_ty.is_any_ptr());
+        if is_wide(src_ty) {
+            self.copy_placement(dest, Placement::Blit(src, 16))
+        } else {
+            self.scalar_result(dest, src, Kl)
+        }
+    }
 }
 
 fn tag_load_store<'tcx>(tcx: TyCtxt<'tcx>, tag: &rustc_abi::Scalar) -> (O, O, Ty<'tcx>) {
@@ -956,6 +974,7 @@ fn tag_load_store<'tcx>(tcx: TyCtxt<'tcx>, tag: &rustc_abi::Scalar) -> (O, O, Ty
             I64 => (O::load, O::storel, tcx.types.i64),
             I128 => todo!(),
         },
+        Pointer(_) => (O::load, O::storel, tcx.types.i64),
         _ => todo!("{:?}", tag),
     }
 }

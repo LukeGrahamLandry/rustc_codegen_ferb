@@ -382,7 +382,13 @@ impl Func {
         self.emit(b, O::blit0, Cls::Kw, Ref::Null, src, dest);
         self.emit(b, O::blit1, Cls::Kw, Ref::Null, n, Ref::Null);
     }
-    
+   
+    pub fn sel(&mut self, b: BlkId, r: impl Reflike, k: Cls, cond: impl Reflike, t: impl Reflike, f: impl Reflike) {
+        let (r, cond, t, f) = (r.r(self), cond.r(self), t.r(self), f.r(self));
+        self.emit(b, O::sel0, Cls::Kw, Ref::Null, cond, Ref::Null);
+        self.emit(b, O::sel1, k, r, t, f);
+    }
+     
     pub fn tmps<const N: usize>(&mut self) -> [Ref; N] {
         // this is what i want: (0..N).map(|_| self.tmp()).collect::<[Ref; N]>();
         let mut it = [Ref::Null; N];

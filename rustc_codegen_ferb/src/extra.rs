@@ -1,16 +1,17 @@
+use rustc_abi::{TagEncoding, Variants};
 use rustc_ast::expand::allocator::{
     AllocatorMethod, AllocatorTy, NO_ALLOC_SHIM_IS_UNSTABLE,
     default_fn_name, global_fn_name,
 };
 use rustc_codegen_ssa::{ModuleKind, base::{allocator_kind_for_codegen, allocator_shim_contents}};
 use rustc_hir::{LangItem, def_id::LOCAL_CRATE};
-use rustc_middle::{mir::mono::{CodegenUnit, CodegenUnitNameBuilder, MonoItem}, ty::{TyCtxt, TypingEnv}};
+use rustc_middle::{mir::mono::{CodegenUnit, CodegenUnitNameBuilder, MonoItem}, ty::{Ty, TyCtxt, TypingEnv}};
 use rustc_session::config::{EntryFnType, OutputType};
 use rustc_span::DUMMY_SP;
 use rustc_symbol_mangling::mangle_internal_symbol;
 use ferb::builder::*;
 
-use crate::{compiled_module, emit::def_symbol, translate_target};
+use crate::{compiled_module, emit::{Emit, Placement, def_symbol}, translate_target};
 
 pub(crate) fn allocator_module(tcx: TyCtxt) -> Option<rustc_codegen_ssa::CompiledModule> {
     allocator_kind_for_codegen(tcx).map(|kind| {
@@ -100,4 +101,25 @@ pub(crate) fn maybe_create_entry_wrapper<'tcx>(m: &mut Module, tcx: TyCtxt<'tcx>
     f.emit(b, O::call, Cls::Kw, r, start_fn, ());
     f.jump(b, J::retw, r, None, None);
     m.func(f);
+}
+
+
+impl<'f, 'tcx> Emit<'f, 'tcx> {
+    // https://github.com/rust-lang/rust/blob/a1db344c0829cb682df4174e9370b60915751605/compiler/rustc_codegen_ssa/src/mir/operand.rs#L483
+    pub(crate) fn get_niche(&mut self, dest: Placement, tag_r: Ref, layout: rustc_abi::TyAndLayout<'_, Ty<'_>>) -> Ref {
+        let Variants::Multiple { tag_encoding, .. } = &layout.variants else { unreachable!() };
+        let TagEncoding::Niche { untagged_variant, niche_variants, niche_start } = tag_encoding else { unreachable!() };
+        let relative_max = niche_variants.end().as_u32() - niche_variants.start().as_u32();
+        assert!(relative_max == 0);  // TODO
+        let is_niche = self.f.tmp();
+        self.emit(O::ceql, Cls::Kw, is_niche, tag_r, *niche_start as u64);
+        let tagged_discr = niche_variants.start().as_u32() as u64;
+        self.f.sel(self.b, tag_r, Cls::Kl, is_niche, tagged_discr, untagged_variant.as_u32() as u64);
+        self.scalar_result(dest, tag_r, Cls::Kl)
+    } 
+    
+    // https://github.com/rust-lang/rust/blob/a1db344c0829cb682df4174e9370b60915751605/compiler/rustc_codegen_ssa/src/mir/place.rs#L496 
+    pub(crate) fn _set_niche(&mut self) -> Ref {
+        todo!()
+    } 
 }
