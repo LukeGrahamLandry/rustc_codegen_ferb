@@ -33,6 +33,7 @@ unsafe extern "C" {
 }
 
 #[repr(i64)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Arch {
     Arm64,
     Amd64,
@@ -41,12 +42,14 @@ pub enum Arch {
 }
 
 #[repr(i64)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Os {
     Macos,
     Linux,
 }
 
 #[repr(i64)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Artifact {
     CachedLate,
     Jit,

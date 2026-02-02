@@ -8,7 +8,7 @@ use rustc_index::{Idx, IndexVec, bit_set::MixedBitSet};
 use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, NonDivergingIntrinsic, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}, pretty::MirWriter}, ty::{EarlyBinder, GenericArgsRef, Instance, InstanceKind, PseudoCanonicalInput, Ty, TyCtxt, TyKind, TypingEnv, adjustment::PointerCoercion, layout::{self, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers, TyAndLayout}, print::with_no_trimmed_paths}};
 use ferb::builder as Ferb;
 use Ferb::{J, O, Reflike, Cls::*};
-use rustc_abi::{ExternAbi, FieldIdx, FieldsShape, HasDataLayout, Size, TagEncoding, Variants};
+use rustc_abi::{ExternAbi, FieldIdx, FieldsShape, HasDataLayout, Size, TagEncoding, VariantIdx, Variants};
 use rustc_span::Span;
 
 const DEBUG: bool = false;
@@ -63,6 +63,15 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
 }
 
 fn emit_func<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>) {
+    if DEBUG {
+        // fixes "diagnostics were expected but none were emitted"
+        with_no_trimmed_paths! {{ emit_func2(m, tcx, it); }};
+    } else {
+        emit_func2(m, tcx, it);
+    }
+}
+
+fn emit_func2<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>) {
     let name = tcx.symbol_name(it).name;
     let id = m.intern(name);
     let mir = tcx.instance_mir(it.def);
@@ -70,14 +79,12 @@ fn emit_func<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>) 
     let ret_ty = EarlyBinder::bind(mir.return_ty());
     let ret_ty = it.instantiate_mir_and_normalize_erasing_regions(tcx, mono, ret_ty);
     
-    if DEBUG {
-        with_no_trimmed_paths! {{  // fixes "diagnostics were expected but none were emitted"
+    if DEBUG && false {
             let mut buf = Vec::new();
             let writer = MirWriter::new(tcx);
             writer.write_mir_fn(mir, &mut buf).unwrap();
             eprintln!("${}();", name);
             eprintln!("{}", String::from_utf8_lossy(&buf).into_owned());
-        }};
     }
     
     let ret = abi_type(m, tcx, ret_ty);
@@ -157,7 +164,7 @@ fn emit_func<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>) 
     if DEBUG {
         let loc = tcx.def_span(it.def.def_id());
         let loc = tcx.sess.source_map().span_to_diagnostic_string(loc.shrink_to_lo());
-        emit.f.comment(emit.m, emit.start_block, &*format!("{}", loc));
+        emit.f.comment(emit.m, emit.start_block, &*format!("{} {}", loc, it));
     }
     emit.allocate_locals();
     emit.f.jump(emit.b, J::jmp, (), Some(emit.blocks[BasicBlock::new(0)]), None);
@@ -241,6 +248,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         for stmt in &blk.statements {
             match &stmt.kind {
                 StatementKind::Assign(box (place, value)) => {
+                    if DEBUG { self.f.comment(self.m, self.b, &*format!("{:?}", stmt)); }
                     let dest = self.addr_place(place);
                     let _ = self.emit_value(value, dest);
                 },
@@ -253,6 +261,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             }
         }
         let terminator = blk.terminator();
+        if DEBUG { self.f.comment(self.m, self.b, &*format!("{:?}", terminator.kind)); }
         match &terminator.kind {
             &TerminatorKind::Goto { target } => {
                 self.f.jump(self.b, J::jmp, (), Some(self.blocks[target]), None);
@@ -546,6 +555,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     CastKind::IntToInt => {
                         let d = dest_ty.primitive_size(self.tcx).bytes();
                         let s = src_ty.primitive_size(self.tcx).bytes();
+                        assert!(d <= 8 && s <= 8);
                         let k = if d == 8 { Kl } else { Kw };
                         if s == d { return self.scalar_result(dest, src, k) };
                         // TODO: sign
@@ -563,19 +573,29 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     },
                     CastKind::PointerExposeProvenance |
                     CastKind::PointerWithExposedProvenance => {
-                        assert!(!is_wide(dest_ty));  // TODO
+                        assert!(!is_wide(dest_ty) && !is_wide(src_ty));  // TODO
+                        assert!(is_big(dest_ty) == is_big(src_ty));
                         self.scalar_result(dest, src, Kl)
                     },
                     CastKind::PointerCoercion(kind, _)  => {
                         match kind {
                             PointerCoercion::ClosureFnPointer(_) => todo!(),
                             PointerCoercion::Unsize => {
+                                assert!(is_wide(dest_ty) && !is_wide(src_ty), "{:?}", dest_ty);
                                 match src_ty.builtin_deref(true).unwrap().kind() {
                                     TyKind::Array(_, size) => {
-                                        assert!(dest_ty.is_array_slice());
                                         let size = size.try_to_scalar().unwrap_or_else(|| todo!("{:?}", size));
                                         let size = self.emit_scalar(Placement::NewScalar(Kl), size, self.tcx.types.isize);
-                                        self.create_pair(dest, src, size)
+                                        let data = if is_big(src_ty) {
+                                            // HACK: i repr all structs in memory. 
+                                            //       when unsizing Box<T>, data is the pointer, not stack slot of Box. 
+                                            let r = self.f.tmp();
+                                            self.emit(O::load, Kl, r, src, ());
+                                            r
+                                        } else {
+                                            src
+                                        };
+                                        self.create_pair(dest, data, size)
                                     },
                                     TyKind::Closure(_, _) => {
                                         let TyKind::Dynamic(bound, _) = dest_ty.builtin_deref(true).unwrap().kind() else { todo!("{:?}", dest_ty) };
@@ -591,7 +611,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                                 }
                             }
                             _ => {
-                                assert!(!is_wide(dest_ty));  // TODO
+                                assert!(!is_wide(dest_ty) && !is_wide(src_ty));  // TODO
                                 self.scalar_result(dest, src, Kl)
                             },
                         }
@@ -656,19 +676,20 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             Rvalue::Aggregate(kind, fields) => {
                 use rustc_middle::mir::AggregateKind::*;
                 let ty = value.ty(self.mir, self.tcx);
+                let ty = self.mono_ty(ty);
                 let mut layout = self.layout(ty);
                 let base = self.get_memory(dest);
                 match **kind {
-                    Adt(_, varient, _, _, active) => {
+                    Adt(_, variant, _, _, active) => {
                         assert!(active.is_none(), "TODO: union");
-                        // TODO: is it in the fields if its niche?
-                        if let Variants::Multiple { tag_encoding: TagEncoding::Direct, tag_field, tag, .. } = &layout.variants {
-                            let value = varient.as_u32() as u64;
-                            let (_, o, ty) = tag_load_store(self.tcx, tag);
-                            let dest = self.offset_placement(base, layout, *tag_field, ty);
-                            let r = self.get_memory(dest);
-                            self.emit(o, Kw, (), value, r);
-                            layout = layout.for_variant(self, varient);
+                        if let Variants::Multiple { tag_encoding, tag_field, tag, .. } = &layout.variants {
+                            if let Some(value) = encoded_tag(variant, tag_encoding) {
+                                let (_, o, ty) = tag_load_store(self.tcx, tag);
+                                let dest = self.offset_placement(base, layout, *tag_field, ty);
+                                let r = self.get_memory(dest);
+                                self.emit(o, Kw, (), value, r);
+                            }
+                            layout = layout.for_variant(self, variant);
                         }
                     }
                     Tuple | Array(_) | Closure(_, _) => (),
@@ -711,6 +732,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             let field = FieldIdx::new(field);
             let value = &fields[field];
             let ty = value.ty(self.mir, self.tcx);
+            if self.layout(ty).size.bytes() == 0 { continue };
             let dest = self.offset_placement(base, layout, field, ty);
             let _ = self.emit_operand(value, dest);
         }
@@ -963,6 +985,20 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     }
 }
 
+fn encoded_tag(variant: VariantIdx, tag_encoding: &TagEncoding<VariantIdx>) -> Option<u64> {
+    Some(match tag_encoding {
+        TagEncoding::Direct => variant.as_u32() as u64,
+        TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
+            if variant == *untagged_variant {
+                return None
+            };
+            let niche_value = variant.as_u32() - niche_variants.start().as_u32();
+            let niche_value = (niche_value as u128).wrapping_add(*niche_start);
+            niche_value as u64
+        },
+    })
+}
+
 fn tag_load_store<'tcx>(tcx: TyCtxt<'tcx>, tag: &rustc_abi::Scalar) -> (O, O, Ty<'tcx>) {
     let tag = tag.primitive();
     use rustc_abi::{Primitive::*, Integer::*};
@@ -1035,6 +1071,7 @@ fn abi_type<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Ferb
             1 => vec![vec![Ferb::Field::Scalar(Ferb::FieldType::Fb)]],
             8 => vec![vec![Ferb::Field::Scalar(Ferb::FieldType::Fl)]],
             16 => vec![vec![Ferb::Field::Scalar(Ferb::FieldType::Fl), Ferb::Field::Scalar(Ferb::FieldType::Fl)]],
+            24 => vec![vec![Ferb::Field::Scalar(Ferb::FieldType::Fl), Ferb::Field::Scalar(Ferb::FieldType::Fl), Ferb::Field::Scalar(Ferb::FieldType::Fl)]],
             _ => vec![],
         },
         is_union: false,
@@ -1100,8 +1137,12 @@ fn get_all_bytes<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: ConstAllocat
 
 fn is_wide(ty: Ty) -> bool {
     assert!(!matches!(ty.kind(), TyKind::Param(_)));
-    if !ty.is_any_ptr() || matches!(ty.kind(), TyKind::FnPtr(_, _)){ return false };
-    let inner = ty.builtin_deref(true).unwrap_or_else(|| todo!("{:?}", ty));
+    let inner = if let Some(it) = ty.boxed_ty() {
+        it
+    } else {
+        if !ty.is_any_ptr() || matches!(ty.kind(), TyKind::FnPtr(_, _)) { return false };
+        ty.builtin_deref(true).unwrap_or_else(|| todo!("{:?}", ty))
+    };
     inner.is_str() || inner.is_array_slice() || inner.is_trait()
 }
 

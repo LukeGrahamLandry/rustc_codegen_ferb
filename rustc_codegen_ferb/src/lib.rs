@@ -173,7 +173,10 @@ fn translate_target(sess: &Session) -> (ferb::Arch, ferb::Os) {
     let arch = match sess.target.arch {
         Arch::AArch64 => ferb::Arch::Arm64,
         Arch::RiscV64 => ferb::Arch::Rv64,
-        Arch::Wasm32 => ferb::Arch::Wasm32,
+        // TODO: the thing i could do currently is outputing wasm32 but pretending the pointers are 64 bit 
+        //       which is not an idea i know how to express to rustc. 
+        //       just making my own target-spec-json isn't enough because i can't build-std yet.
+        Arch::Wasm32 => todo!(),
         Arch::Wasm64 => todo!(),
         Arch::X86_64 => ferb::Arch::Amd64,
         _ => todo!(),
@@ -181,6 +184,7 @@ fn translate_target(sess: &Session) -> (ferb::Arch, ferb::Os) {
     let os = match sess.target.os {
         Os::Linux => ferb::Os::Linux,
         Os::MacOs => ferb::Os::Macos,
+        Os::Unknown => todo!(),
         _ => todo!(),
     };
     (arch, os)

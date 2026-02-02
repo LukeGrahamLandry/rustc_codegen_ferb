@@ -14,6 +14,12 @@ pub extern "C" fn main() -> i32 {
         Some(x) if x.get() == 123 => (),
         _ => return 2,
     };
+    let x: Option<NonZeroU64> = None;
+    if !x.is_none() { return 3 };
+    
+    enum Foo { _A, _B } struct Bar { _a: usize, _b: Foo }  // same shape as core::alloc::Layout
+    let x: Option<(usize, Bar)> = None;
+    if !x.is_none() { return 4 };
     
     0
 }

@@ -13,6 +13,7 @@ pub extern "C" fn main() -> i32 {
     let foo = |a: i32| a + x;
     if call_dyn(&foo, -3) != 0 { return 2 };
     
+    // same shape as std::rt::lang_start
     let bar: fn() -> i32 = bar;
     if call_dyn_unit2(bar) != 123 { return 3 };
     
