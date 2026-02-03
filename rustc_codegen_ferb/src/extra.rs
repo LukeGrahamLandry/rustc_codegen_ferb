@@ -1,11 +1,11 @@
-use rustc_abi::{TagEncoding, Variants};
+use rustc_abi::{ExternAbi, TagEncoding, Variants};
 use rustc_ast::expand::allocator::{
     AllocatorMethod, AllocatorTy, NO_ALLOC_SHIM_IS_UNSTABLE,
     default_fn_name, global_fn_name,
 };
 use rustc_codegen_ssa::{ModuleKind, base::{allocator_kind_for_codegen, allocator_shim_contents}};
 use rustc_hir::{LangItem, def_id::LOCAL_CRATE};
-use rustc_middle::{mir::mono::{CodegenUnit, CodegenUnitNameBuilder, MonoItem}, ty::{Ty, TyCtxt, TypingEnv}};
+use rustc_middle::{mir::{Place, mono::{CodegenUnit, CodegenUnitNameBuilder, MonoItem}}, ty::{Instance, InstanceKind, Ty, TyCtxt, TyKind, TypingEnv}};
 use rustc_session::config::{EntryFnType, OutputType};
 use rustc_span::DUMMY_SP;
 use rustc_symbol_mangling::mangle_internal_symbol;
@@ -105,6 +105,36 @@ pub(crate) fn maybe_create_entry_wrapper<'tcx>(m: &mut Module, tcx: TyCtxt<'tcx>
 
 
 impl<'f, 'tcx> Emit<'f, 'tcx> {
+    // https://github.com/rust-lang/rust/blob/a1db344c0829cb682df4174e9370b60915751605/compiler/rustc_codegen_ssa/src/mir/block.rs#L596
+    pub(crate) fn call_drop(&mut self, place: &Place<'tcx>) {
+        let ty = self.mono_ty(place.ty(self.mir, self.tcx).ty);
+        let drop_fn = Instance::resolve_drop_in_place(self.tcx, ty);
+
+        if let InstanceKind::DropGlue(_, None) = drop_fn.def {
+            // you get TerminatorKind::Drop that does nothing 
+            // when generic without +Copy bound but the concrete type is copy. 
+            return;
+        }
+        // TODO: factor out the terminatorkind::call stuff so this can just call it with the instance?
+        
+        if let TyKind::Dynamic(_, _) = ty.kind() {
+            todo!("{:?} {:?}", place, drop_fn);
+        }
+        
+        // not one that has special handling in TerminatorKind::Call
+        let sig = drop_fn.ty(self.tcx, TypingEnv::fully_monomorphized()).fn_sig(self.tcx);
+        assert!(sig.abi() != ExternAbi::RustCall);
+        assert!(!matches!(drop_fn.def, InstanceKind::Intrinsic(_) | InstanceKind::Virtual(_, _)));
+        assert!(!drop_fn.def.requires_caller_location(self.tcx));  // TODO
+        
+        let place = self.addr_place(place);
+        let Placement::Blit(r, _) = place else { todo!() }; 
+        // TODO: can you drop an unsized type other than a trait object? wide *mut T
+        let id = self.m.intern(self.tcx.symbol_name(drop_fn).name);
+        self.emit(O::arg, Cls::Kl, (), r, ());
+        self.emit(O::call, Cls::Kw, (), id, ());
+    }
+    
     // https://github.com/rust-lang/rust/blob/a1db344c0829cb682df4174e9370b60915751605/compiler/rustc_codegen_ssa/src/mir/operand.rs#L483
     pub(crate) fn get_niche(&mut self, dest: Placement, tag_r: Ref, layout: rustc_abi::TyAndLayout<'_, Ty<'_>>) -> Ref {
         let Variants::Multiple { tag_encoding, .. } = &layout.variants else { unreachable!() };
@@ -116,10 +146,5 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         let tagged_discr = niche_variants.start().as_u32() as u64;
         self.f.sel(self.b, tag_r, Cls::Kl, is_niche, tagged_discr, untagged_variant.as_u32() as u64);
         self.scalar_result(dest, tag_r, Cls::Kl)
-    } 
-    
-    // https://github.com/rust-lang/rust/blob/a1db344c0829cb682df4174e9370b60915751605/compiler/rustc_codegen_ssa/src/mir/place.rs#L496 
-    pub(crate) fn _set_niche(&mut self) -> Ref {
-        todo!()
-    } 
+    }
 }

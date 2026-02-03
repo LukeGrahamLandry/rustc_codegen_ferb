@@ -17,7 +17,10 @@ pub extern "C" fn main() -> i32 {
     let bar: fn() -> i32 = bar;
     if call_dyn_unit2(bar) != 123 { return 3 };
     
-    0
+    let mut x = 1;
+    { let _ = Defer(Some(|| x = 0)); };
+    { core::mem::forget(Defer(Some(|| x = 2))); };
+    x
 }
 
 fn call_dyn(f: &dyn Fn(i32) -> i32, a: i32) -> i32 { f(a) }
@@ -27,6 +30,13 @@ fn call_once<F, T>(f: F) -> T where F: FnOnce() -> T { f() }
 fn call_dyn_unit(f: &dyn Fn() -> i32) -> i32 { f() }
 fn call_dyn_unit2(f: fn() -> i32) -> i32 { 
     call_dyn_unit(&move || call_once(f)) 
+}
+
+struct Defer<F: FnOnce()>(Option<F>);
+impl<F: FnOnce()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        self.0.take().unwrap()();
+    }
 }
 
 #[panic_handler] fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }

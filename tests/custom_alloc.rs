@@ -25,7 +25,6 @@ unsafe impl GlobalAlloc for BssAllocator {
 unsafe extern "C" { fn printf(fmt: *const u8, ...) -> i32; }
 fn main() {
     unsafe { printf("main() via std::rt::lang_start\n\0".as_ptr()) };
-    println!("Hello World! {}", 42);
     
     let mut n = 0;
     let mut check = |cond: bool| {
@@ -35,7 +34,6 @@ fn main() {
     
     let x = Box::new(123);
     check(*x == 123);
-    std::mem::forget(x);
     
     const E: usize = 0x0065656565656565;
     let mut x = vec![E];
@@ -43,7 +41,8 @@ fn main() {
     unsafe { printf("x(*v) = %lx; s(v) = %s;\n\0".as_ptr(), *v, v) };
     x.push(0);
     check(x[0] == E && x.len() == 2 && x.capacity() > 1);
-    std::mem::forget(x);
+    
+    println!("Hello World! {}", n);
 }
 
 // i'm cheating. see "TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO" in emit.rs

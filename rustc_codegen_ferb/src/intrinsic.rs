@@ -59,12 +59,14 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             }
             sym::write_bytes => {
                 let id = self.m.intern("memset");
+                // TODO: scale size!
                 let (dest, value, size) = (arg_vals[0], arg_vals[1], arg_vals[2]);
                 self.emit(O::arg, Kl, (), dest, ());
                 self.emit(O::arg, Kl, (), value, ());
                 self.emit(O::arg, Kl, (), size, ());
                 self.emit(O::call, Kw, (), id, ());
             }
+            // TODO: unsized types?
             sym::size_of_val => {
                 let size = self.layout(inputs[0]).size.bytes();
                 self.scalar_result(dest, size, Kl);

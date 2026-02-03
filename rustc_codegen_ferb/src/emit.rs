@@ -23,7 +23,7 @@ pub(crate) struct Emit<'f, 'tcx> {
     instance: Instance<'tcx>,
     start_block: Ferb::BlkId,
     return_block: Ferb::BlkId,
-    mir: &'tcx Body<'tcx>,
+    pub(crate) mir: &'tcx Body<'tcx>,
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -275,7 +275,8 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 let f_ty = func.ty(self.mir, self.tcx);
                 let f_ty = self.mono_ty(f_ty);
                 let mut callee = self.emit_operand(func, Placement::NewScalar(Kl));
-                let sig = f_ty.fn_sig(self.tcx);
+                // TODO: is this different from fn_abi_of_instance?
+                let sig = f_ty.fn_sig(self.tcx);  
                 
                 let mut arg_count = sig.inputs().skip_binder().len();
                 let mut arg_types = args.iter().map(|arg| self.abi_type(arg.node.ty(self.mir, self.tcx))).collect::<Vec<_>>();
@@ -288,6 +289,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     .collect::<Vec<_>>();
                 if let &TyKind::FnDef(id, generics) = f_ty.kind() {
                     let (_, instance) = def_symbol(self.m, self.tcx, id, Some(generics));
+                    // miscompile: assert!(!instance.def.requires_caller_location(self.tcx));
                     
                     // TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
                     // how am i supposed to get this one on the list??
@@ -309,6 +311,12 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         InstanceKind::Virtual(_, vtable_index) => {
                             assert!(!sig.c_variadic());
                             callee = self.load_trait_object(&mut arg_vals[0], &mut arg_types[0], vtable_index);
+                        }
+                        InstanceKind::DropGlue(_, None) => {
+                            // avoid linker error for nop drop
+                            // TODO: i don't understand how it decides if call this or TerminatorKind::Drop
+                            self.f.jump(self.b, j, (), target, None);
+                            return;
                         }
                         _ => ()
                     }
@@ -393,8 +401,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             }
             TerminatorKind::Drop { place, target, drop, async_fut, .. } => {
                 assert!(drop.is_none() && async_fut.is_none());
-                // you get one of these even if it does nothing when generic over something without +Copy
-                let _ = place;  // TODO
+                self.call_drop(place);
                 self.f.jump(self.b, J::jmp, (), Some(self.blocks[*target]), None);
             }
             TerminatorKind::Unreachable |
@@ -485,7 +492,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         }
     }
     
-    fn new_placement(&mut self, ty: Ty<'tcx>) -> Placement {
+    pub(crate) fn new_placement(&mut self, ty: Ty<'tcx>) -> Placement {
         let size = self.layout(ty).size.bytes_usize();
         if size == 0 && !matches!(ty.kind(), TyKind::FnDef(_, _)) {
             return Placement::Zst;
@@ -753,7 +760,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         r2
     }
     
-    fn addr_place(&mut self, place: &Place<'tcx>) -> Placement {
+    pub fn addr_place(&mut self, place: &Place<'tcx>) -> Placement {
         let ty = place.ty(self.mir, self.tcx);
         if let Some(it) = place.as_local() {
             return self.locals[it];
@@ -935,7 +942,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         val_cls(ty)
     }
     
-    fn mono_ty(&self, it: Ty<'tcx>) -> Ty<'tcx> {
+    pub(crate) fn mono_ty(&self, it: Ty<'tcx>) -> Ty<'tcx> {
         let mono = TypingEnv::fully_monomorphized();
         let it = EarlyBinder::bind(it);
         self.instance.instantiate_mir_and_normalize_erasing_regions(self.tcx, mono, it)
