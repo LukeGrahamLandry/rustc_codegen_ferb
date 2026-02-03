@@ -79,6 +79,9 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 let loc = self.caller_location(source_info);
                 self.scalar_result(dest, loc, Kl);
             }
+            sym::assert_inhabited => {
+                // TODO
+            }
             _ => return false,
         }
         true

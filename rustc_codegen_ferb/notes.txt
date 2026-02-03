@@ -1,0 +1,8 @@
+
+---
+mir is made before replacing generics but emit_func for each instantiation 
+so have to explicitly monomorphise types all over the place. 
+also means you get things that are weird for specific type
+because all versions of the function must have same shape mir. 
+i.e. calls to nop drop, reading zero sized types from a struct field, etc.
+---

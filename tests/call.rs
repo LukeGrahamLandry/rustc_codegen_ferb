@@ -12,16 +12,19 @@ pub extern "C" fn main() -> i32 {
     
     let foo = |a: i32| a + x;
     if call_dyn(&foo, -3) != 0 { return 2 };
+    if call_dyn(&|_| 0, 0) != 0 { return 4 };  // zst (no captures)
     
     // same shape as std::rt::lang_start
     let bar: fn() -> i32 = bar;
     if call_dyn_unit2(bar) != 123 { return 3 };
     
     track_caller();
+    unsized_struct();
     
     let mut x = 1;
-    { let _ = Defer(Some(|| x = 0)); };
-    { core::mem::forget(Defer(Some(|| x = 2))); };
+    { let _ = defer(|| x = 0); };
+    { core::mem::forget(defer(|| x = 2)); };
+    defer(|| ());  // zst (no captures)
     x
 }
 
@@ -34,6 +37,7 @@ fn call_dyn_unit2(f: fn() -> i32) -> i32 {
     call_dyn_unit(&move || call_once(f)) 
 }
 
+fn defer<F: FnOnce()>(f: F) -> Defer<F> { Defer(Some(f)) }
 struct Defer<F: FnOnce()>(Option<F>);
 impl<F: FnOnce()> Drop for Defer<F> {
     fn drop(&mut self) {
@@ -45,7 +49,6 @@ fn track_caller() {
     use core::panic::Location;
     #[track_caller] fn track_yes() -> &'static Location<'static> { Location::caller() }
     fn track_no() -> &'static Location<'static> { Location::caller() }
-    unsafe extern "C" { fn printf(fmt: *const u8, ...) -> i32; }
     
     let loc = &[track_no(), track_yes(), Location::caller()];
     for loc in loc {
@@ -57,5 +60,17 @@ fn track_caller() {
     }
 }
 
+fn unsized_struct() {
+    struct S<T: ?Sized>(i64, T);
+    let s: S<[i32; 3]> = S(123, [1, 2, 3]);  
+    let s: &S<[i32; 3]> = &s;  // no metadata
+    let s: &S<[i32]> = s;  // unsize. metadata is length of the array
+    let ss = &s.1; // offset to the field but keep the same metadata
+    unsafe { printf("unsized; s.0 = %ld, s.1.len = %ld\n\0".as_ptr(), s.0, ss.len()) };
+
+    for _ in [0] {};  // ^ same shape as PolymorphicIter<[T]>
+}
+
+unsafe extern "C" { fn printf(fmt: *const u8, ...) -> i32; }
 #[panic_handler] fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
 #[lang = "eh_personality"] pub fn rust_eh_personality() -> ! { loop {} }
