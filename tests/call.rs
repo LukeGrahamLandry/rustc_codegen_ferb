@@ -17,6 +17,8 @@ pub extern "C" fn main() -> i32 {
     let bar: fn() -> i32 = bar;
     if call_dyn_unit2(bar) != 123 { return 3 };
     
+    track_caller();
+    
     let mut x = 1;
     { let _ = Defer(Some(|| x = 0)); };
     { core::mem::forget(Defer(Some(|| x = 2))); };
@@ -36,6 +38,22 @@ struct Defer<F: FnOnce()>(Option<F>);
 impl<F: FnOnce()> Drop for Defer<F> {
     fn drop(&mut self) {
         self.0.take().unwrap()();
+    }
+}
+
+fn track_caller() {
+    use core::panic::Location;
+    #[track_caller] fn track_yes() -> &'static Location<'static> { Location::caller() }
+    fn track_no() -> &'static Location<'static> { Location::caller() }
+    unsafe extern "C" { fn printf(fmt: *const u8, ...) -> i32; }
+    
+    let loc = &[track_no(), track_yes(), Location::caller()];
+    for loc in loc {
+        // TODO: should be loc.file_as_c_str() but if i do that llvm and i disagree unless i reorder so %s is last
+        //       but llvm is the one that changes. so i guess i'm "wrong" to pass single field struct as a scalar to vararg but that happens to behave sanely.
+        //       file.as_ptr happens to work because it stores it with the extra zero rather than reallocating. 
+        //       correct thing is file_as_c_str.as_ptr... but i miscompile that. TODO!
+        unsafe { printf("%s:%d:%d\n\0".as_ptr(), loc.file().as_ptr(), loc.line(), loc.column()) };
     }
 }
 

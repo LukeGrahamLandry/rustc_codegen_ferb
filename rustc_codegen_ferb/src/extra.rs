@@ -125,7 +125,8 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         let sig = drop_fn.ty(self.tcx, TypingEnv::fully_monomorphized()).fn_sig(self.tcx);
         assert!(sig.abi() != ExternAbi::RustCall);
         assert!(!matches!(drop_fn.def, InstanceKind::Intrinsic(_) | InstanceKind::Virtual(_, _)));
-        assert!(!drop_fn.def.requires_caller_location(self.tcx));  // TODO
+        // drop_in_place isn't #[track_caller], specific impl Drop doesn't matter.
+        assert!(!drop_fn.def.requires_caller_location(self.tcx));
         
         let place = self.addr_place(place);
         let Placement::Blit(r, _) = place else { todo!() }; 

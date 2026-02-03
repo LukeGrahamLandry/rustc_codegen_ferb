@@ -24,6 +24,7 @@ pub(crate) struct Emit<'f, 'tcx> {
     start_block: Ferb::BlkId,
     return_block: Ferb::BlkId,
     pub(crate) mir: &'tcx Body<'tcx>,
+    pub(crate) caller_location: Option<Ferb::Ref>,
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -101,6 +102,7 @@ fn emit_func2<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>)
         instance: it,
         start_block,
         mir,
+        caller_location: None,
     };
     
     let count = if mir.spread_arg.is_some() { 1 } else { mir.arg_count };
@@ -143,6 +145,7 @@ fn emit_func2<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>)
             arg_vals.push(r);
         }
         
+        emit.caller_location_par();
         let layout = emit.layout(ty);
         let size = layout.size.bytes_usize();
         let base = emit.alloca(size);
@@ -160,6 +163,8 @@ fn emit_func2<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>)
         if size == 0 {
             emit.locals[args_tuple] = Placement::Zst;
         }
+    } else {
+        emit.caller_location_par();
     }
     if DEBUG {
         let loc = tcx.def_span(it.def.def_id());
@@ -178,6 +183,13 @@ fn emit_func2<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>)
 }
 
 impl<'f, 'tcx> Emit<'f, 'tcx> {
+    fn caller_location_par(&mut self) {
+        if !self.instance.def.requires_caller_location(self.tcx) { return }
+        let r = self.f.tmp();
+        self.emit(O::par, Kl, r, (), ());
+        self.caller_location = Some(r);
+    }
+    
     fn allocate_locals(&mut self) {
         let mut needs_alloca = MixedBitSet::<Local>::new_empty(self.mir.local_decls.len());
         for b in self.mir.basic_blocks.iter() {
@@ -287,9 +299,10 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         Ferb::Ret::T(t) => Placement::NewMemory(self.m.size_of(t)),
                     }))
                     .collect::<Vec<_>>();
+                let mut caller_location = false;
                 if let &TyKind::FnDef(id, generics) = f_ty.kind() {
                     let (_, instance) = def_symbol(self.m, self.tcx, id, Some(generics));
-                    // miscompile: assert!(!instance.def.requires_caller_location(self.tcx));
+                    caller_location = instance.def.requires_caller_location(self.tcx);
                     
                     // TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
                     // how am i supposed to get this one on the list??
@@ -303,7 +316,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     match instance.def {
                         InstanceKind::Intrinsic(def) => {
                             assert!(!sig.c_variadic());
-                            if self.call_intrinsic(dest, &arg_vals, def, sig.inputs().skip_binder()) {
+                            if self.call_intrinsic(dest, &arg_vals, def, sig.inputs().skip_binder(), terminator.source_info) {
                                 self.f.jump(self.b, j, (), target, None);
                                 return;
                             }
@@ -348,6 +361,10 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 if sig.c_variadic() && args.len() == arg_count {
                     // wasm cares if variadic even if none passed
                     self.f.emit(self.b, O::argv, Kw, (), (), ());
+                }
+                if caller_location {
+                    let r = self.caller_location(terminator.source_info);
+                    self.emit(O::arg, Kl, (), r, ());
                 }
                 
                 let ret = sig.output();
@@ -871,38 +888,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
             Operand::Move(place) => self.load_place(dest, place),
             Operand::Constant(it) => {
                 let (val, ty) = self.finish_const(it);
-                match val {
-                    ConstValue::Scalar(it) => {
-                        let ty = operand.ty(self.mir, self.tcx);
-                        self.emit_scalar(dest, it, ty)
-                    }
-                    ConstValue::ZeroSized => {
-                        // const known function gets here. the value is stored in the type field. 
-                        match ty.kind() {
-                            &TyKind::FnDef(def, args) => {
-                                let (id, _) = def_symbol(self.m, self.tcx, def, Some(args));
-                                assert!(dest != Placement::Zst);
-                                self.scalar_result(dest, id, Kl)
-                            },
-                            &TyKind::Tuple(it) => {
-                                assert!(it.len() == 0, "{:?}", ty);
-                                self.scalar_result(dest, Ferb::Ref::Undef, Kl)
-                            }
-                            TyKind::Adt(_, _) => self.scalar_result(dest, Ferb::Ref::Undef, Kl),
-                            _ => todo!("zst {:?}", ty)
-                        }
-                    }
-                    ConstValue::Slice { alloc_id, meta } => {
-                        let p = self.global_alloc(alloc_id, Size::ZERO);
-                        self.create_pair(dest, p, meta)
-                    }
-                    ConstValue::Indirect { alloc_id, offset } => {
-                        let size = self.layout(ty).size.bytes_usize();
-                        let src = self.global_alloc(alloc_id, offset);
-                        let src = src.r(self.f);
-                        self.copy_placement(dest, Placement::Blit(src, size))
-                    }
-                }
+                self.emit_const(dest, val, ty)
             }
             Operand::RuntimeChecks(it) => {
                 let it = it.value(self.tcx.sess);
@@ -911,6 +897,38 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         }
     }
     
+    pub(crate) fn emit_const(&mut self, dest: Placement, val: ConstValue, ty: Ty<'tcx>) -> Ferb::Ref {
+        match val {
+            ConstValue::Scalar(it) => self.emit_scalar(dest, it, ty),
+            ConstValue::ZeroSized => {
+                // const known function gets here. the value is stored in the type field. 
+                match ty.kind() {
+                    &TyKind::FnDef(def, args) => {
+                        let (id, _) = def_symbol(self.m, self.tcx, def, Some(args));
+                        assert!(dest != Placement::Zst);
+                        self.scalar_result(dest, id, Kl)
+                    },
+                    &TyKind::Tuple(it) => {
+                        assert!(it.len() == 0, "{:?}", ty);
+                        self.scalar_result(dest, Ferb::Ref::Undef, Kl)
+                    }
+                    TyKind::Adt(_, _) => self.scalar_result(dest, Ferb::Ref::Undef, Kl),
+                    _ => todo!("zst {:?}", ty)
+                }
+            }
+            ConstValue::Slice { alloc_id, meta } => {
+                let p = self.global_alloc(alloc_id, Size::ZERO);
+                self.create_pair(dest, p, meta)
+            }
+            ConstValue::Indirect { alloc_id, offset } => {
+                let size = self.layout(ty).size.bytes_usize();
+                let src = self.global_alloc(alloc_id, offset);
+                let src = src.r(self.f);
+                self.copy_placement(dest, Placement::Blit(src, size))
+            }
+        }
+    }
+        
     // TODO: dumb because i know im slow at promoting if you keep recalculating the address for the second slot.
     fn create_pair(&mut self, dest: Placement, a: impl Reflike, b: impl Reflike) -> Ferb::Ref {
         let r = self.get_memory(dest);

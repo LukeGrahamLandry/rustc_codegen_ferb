@@ -1,7 +1,7 @@
 use ferb::builder as Ferb;
 use Ferb::{O, J, Cls::*};
 use rustc_hir::def_id::DefId;
-use rustc_middle::{mir::{AssertKind, CopyNonOverlapping, Operand}, ty::Ty};
+use rustc_middle::{mir::{AssertKind, CopyNonOverlapping, Operand, SourceInfo}, ty::Ty};
 use rustc_span::sym;
 
 use crate::emit::{Emit, Placement};
@@ -37,7 +37,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
         self.f.jump(failed, J::hlt, (), None, None);
     }
         
-    pub(crate) fn call_intrinsic(&mut self, dest: Placement, arg_vals: &[Ferb::Ref], def: DefId, inputs: &'tcx [Ty<'tcx>]) -> bool {
+    pub(crate) fn call_intrinsic(&mut self, dest: Placement, arg_vals: &[Ferb::Ref], def: DefId, inputs: &'tcx [Ty<'tcx>], source_info: SourceInfo) -> bool {
         let intrinsic = self.tcx.item_name(def);
         match intrinsic {
             sym::black_box => {
@@ -75,8 +75,20 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 let size = self.layout(inputs[0]).align.bytes();
                 self.scalar_result(dest, size, Kl);
             }
+            sym::caller_location => {
+                let loc = self.caller_location(source_info);
+                self.scalar_result(dest, loc, Kl);
+            }
             _ => return false,
         }
         true
+    }
+    
+    // from source_info or the one captured by caller_location_par if this function is #[track_caller]
+    pub(crate) fn caller_location(&mut self, source_info: SourceInfo) -> Ferb::Ref {
+        self.mir.caller_location_span(source_info, self.caller_location, self.tcx, |it| {
+            let it = self.tcx.span_as_caller_location(it);
+            self.emit_const(Placement::NewScalar(Kl), it, self.tcx.caller_location_ty())
+        })
     }
 }
