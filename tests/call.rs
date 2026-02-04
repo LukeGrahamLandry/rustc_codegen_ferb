@@ -3,6 +3,14 @@
 
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
+    track_caller();
+    unsized_struct();
+    static mut _FNS: [*const fn(); 1] = [main as *const fn()];
+    trait_object();
+    closures()
+}
+
+fn closures() -> i32 {
     let x = core::hint::black_box(3);  // intrinsic!
     
     let f = |a, b| x - a - b;
@@ -17,10 +25,6 @@ pub extern "C" fn main() -> i32 {
     // same shape as std::rt::lang_start
     let bar: fn() -> i32 = bar;
     if call_dyn_unit2(bar) != 123 { return 3 };
-    
-    track_caller();
-    unsized_struct();
-    static mut _FNS: [*const fn(); 1] = [main as *const fn()];
     
     let mut x = 1;
     { let _ = defer(|| x = 0); };
@@ -70,6 +74,19 @@ fn unsized_struct() {
     unsafe { printf("unsized; s.0 = %ld, s.1.len = %ld\n\0".as_ptr(), s.0, ss.len()) };
 
     for _ in [0] {};  // ^ same shape as PolymorphicIter<[T]>
+}
+
+fn trait_object() {
+    trait Foo { fn value(&self) -> i64; }
+    impl Foo for &[i64] { fn value(&self) -> i64 { self[0] } }
+    impl Foo for [i64; 3] { fn value(&self) -> i64 { self[1] } }
+    impl Foo for &[i64; 3] { fn value(&self) -> i64 { self[2] } }
+    fn show(t: &dyn Foo) { unsafe { printf("%ld\n\0".as_ptr(), t.value()); } }
+    // arrays are interesting because they also unsize to slice
+    let s: [i64; 3] = [1, 2, 3]; 
+    show(&&s[..]);
+    show(&s);
+    show(&&s);
 }
 
 unsafe extern "C" { fn printf(fmt: *const u8, ...) -> i32; }

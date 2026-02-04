@@ -61,6 +61,7 @@ pub extern "C" fn main() -> usize {
     let x = 0usize;
     let x = x as u32;
     if x != 0 { return 3 };
+    if false != !(x == 0) { return 4 };
     let v: fn() = voidcall;
     v();
     let vv = [(1, 1), (1usize, value), (1, 1)];

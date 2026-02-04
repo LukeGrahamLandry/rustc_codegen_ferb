@@ -662,19 +662,20 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 }
             }
             Rvalue::UnaryOp(op, value) => {
+                let ty = self.mono_ty(value.ty(self.mir, self.tcx));
                 match op {
                     UnOp::PtrMetadata => {
-                        let p = self.new_placement(value.ty(self.mir, self.tcx));
+                        let p = self.new_placement(ty);
                         let p = self.emit_operand(value, p);
                         let r = self.get_pair_slot(p, false);
                         self.scalar_result(dest, r, Kl)
                     }
                     UnOp::Not => {
-                        // TODO: what's bool bit pattern? match(bool) => b == 0 instead?
-                        let (k, _) = self.cls(value.ty(self.mir, self.tcx));
+                        let (k, _) = self.cls(ty);
+                        let (o, a) = if ty.is_bool() { (O::ceqw, 0) } else { (O::xor, -1i64) };
                         let src = self.emit_operand(value, Placement::NewScalar(k));
                         let r = self.scalar_dest(dest);
-                        self.emit(O::xor, k, r, src, -1i64);
+                        self.emit(o, k, r, src, a);
                         self.scalar_result(dest, r, k)
                     }
                     _ => todo!("{:?} {:?}", op, value)
@@ -768,46 +769,45 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     fn unsize(&mut self, dest: Placement, src_ty: Ty<'tcx>, dest_ty: Ty<'tcx>, src: Ferb::Ref) -> Ferb::Ref {
         assert!(self.is_wide(dest_ty) && !self.is_wide(src_ty), "{:?} -> {:?}", src_ty, dest_ty);
         let real_src_ty = src_ty;
-        let mut src_ty = src_ty.builtin_deref(true).unwrap();
-        let mut dest_ty = dest_ty.builtin_deref(true).unwrap();
-        loop {
-            match src_ty.kind() {
-                // *[T; N] -> (*[T], N);
-                TyKind::Array(_, size) => {
-                    let size = size.try_to_scalar().unwrap_or_else(|| todo!("{:?}", size));
-                    let size = self.emit_scalar(Placement::NewScalar(Kl), size, self.tcx.types.isize);
-                    let data = if is_big(real_src_ty) {
-                        // HACK: i repr all structs in memory. 
-                        //       when unsizing Box<T>, data is the pointer, not stack slot of Box. 
-                        let r = self.f.tmp();
-                        self.emit(O::load, Kl, r, src, ());
-                        r
-                    } else {
-                        src
-                    };
-                    return self.create_pair(dest, data, size)
-                },
-                // *(|| {}) -> (*captures, *vtable);
-                TyKind::Closure(_, _) => {
-                    let TyKind::Dynamic(bound, _) = dest_ty.kind() else { todo!("{:?}", dest_ty) };
-                    let bound = bound.principal().map(|it| self.tcx.instantiate_bound_regions_with_erased(it));
-                    let id = self.tcx.vtable_allocation((real_src_ty, bound));
-                    let id = self.global_alloc(id, Size::from_bytes(0));
+        let src_ty = src_ty.builtin_deref(true).unwrap();
+        let dest_ty = dest_ty.builtin_deref(true).unwrap();
+        let (src_ty, dest_ty) = self.tcx.struct_lockstep_tails_for_codegen(src_ty, dest_ty, TypingEnv::fully_monomorphized());
+        match dest_ty.kind() {
+            // *[T; N] -> (*[T], N);
+            TyKind::Slice(_) | TyKind::Str => {
+                let TyKind::Array(_, size) = src_ty.kind() else { todo!() };
+                let size = size.try_to_scalar().unwrap_or_else(|| todo!("{:?}", size));
+                let size = self.emit_scalar(Placement::NewScalar(Kl), size, self.tcx.types.isize);
+                let data = if is_big(real_src_ty) {
+                    // HACK: i repr all structs in memory. 
+                    //       when unsizing Box<T>, data is the pointer, not stack slot of Box. 
+                    let r = self.f.tmp();
+                    self.emit(O::load, Kl, r, src, ());
+                    r
+                } else {
+                    src
+                };
+                self.create_pair(dest, data, size)
+            },
+            // *(|| {}) -> (*captures, *vtable);   or any other trait object
+            TyKind::Dynamic(bound, _) => {
+                assert!(!matches!(src_ty.kind(), TyKind::Dynamic(_, _)));   // TODO: is this special?
+                // TODO: surely i shouldn't need a special case for this?
+                let closure = matches!(src_ty.kind(), TyKind::Closure(_, _));
+                let self_type = if closure { real_src_ty } else { src_ty };
+                let bound = bound.principal().map(|it| self.tcx.instantiate_bound_regions_with_erased(it));
+                let id = self.tcx.vtable_allocation((self_type, bound));
+                let id = self.global_alloc(id, Size::from_bytes(0));
+                let data = if closure { 
                     let data = self.alloca(8);     // &&Closure
                     self.emit(O::storel, Kw, (), src, data);
-                    return self.create_pair(dest, data, id)  // &dyn Fn()
-                }
-                // struct S<T: ?Sized>(T); *S([T; N]) -> (*S([T]), N);
-                TyKind::Adt(src_def, _) => {
-                    let TyKind::Adt(dest_def, _) = dest_ty.kind() else { todo!() };
-                    assert!(src_def == dest_def);
-                    // TODO: zst as the last field and unsized before it? 
-                    let (src_layout, dest_layout) = (self.layout(src_ty), self.layout(dest_ty));
-                    src_ty = src_layout.field(&WasteOfTime(self.tcx), src_layout.fields.count() - 1).ty;
-                    dest_ty = dest_layout.field(&WasteOfTime(self.tcx), dest_layout.fields.count() - 1).ty;
-                }
-                _ => todo!("{:?}", src_ty),
+                    data
+                } else {
+                    src
+                };
+                self.create_pair(dest, data, id)
             }
+            _ => todo!(),
         }
     }
     
@@ -905,11 +905,11 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 }
                 ConstantIndex { offset, from_end, .. } => {
                     assert!(!from_end, "{:?}", place);  // TODO
-                    let inner = match parent_ty.kind() {
-                        &TyKind::Slice(inner) => inner,
+                    let (inner, p) = match parent_ty.kind() {
+                        &TyKind::Slice(inner) => (inner, self.get_pair_slot(base, true)),
+                        &TyKind::Array(inner, _) => (inner, base),
                         _ => todo!(), 
                     };
-                    let p = self.get_pair_slot(base, true);
                     (inner, self.step_pointer(p, offset, inner))
                 }
                 _ => todo!("{:?}", place),
@@ -1211,9 +1211,7 @@ fn abi_type<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, c: &mut Ctx<'tcx>, ty
             let inner = abi_field(m, tcx, c, inner.ty);
             for _ in 0..count {
                 fields.push(inner);
-                if size != stride.bytes() {
-                    fields.push(Pad(stride.bytes() as u32 - size as u32))
-                }
+                pad(&mut fields, stride.bytes() as u32 - size as u32);
             }
             vec![fields]
         }
@@ -1221,22 +1219,19 @@ fn abi_type<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, c: &mut Ctx<'tcx>, ty
             let mut fields = vec![];
             let mut off = 0;
             for it in in_memory_order {
-                if offsets[*it].bytes() as u32 != off {
-                    fields.push(Pad(offsets[*it].bytes() as u32 - off))
-                }
+                pad(&mut fields, offsets[*it].bytes() as u32 - off);
                 let ty = layout.field(&WasteOfTime(tcx), it.as_usize());
                 if is_wide(tcx, ty.ty) {
-                    for _ in 0..2 {
+                    // TODO: clearly my is_wide doesn't work
+                    for _ in 0..ty.layout.size.bytes()/8 {
                         fields.push(Scalar(Ferb::FieldType::Fl));
                     }
                 } else {
                     fields.push(abi_field(m, tcx, c, ty.ty));
                 }
-                off += ty.layout.size.bytes() as u32;
+                off = offsets[*it].bytes() as u32 + ty.layout.size.bytes() as u32;
             }
-            if size as u32 != off {
-                fields.push(Pad(size as u32 - off))
-            }
+            pad(&mut fields, size as u32 - off);
             vec![fields]
         },
     };
@@ -1267,6 +1262,19 @@ fn abi_field<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, c: &mut Ctx<'tcx>, t
             Ferb::Ret::Void => Pad(0),
             Ferb::Ret::T(t) => Struct(t),
         }
+    }
+}
+
+// TODO: this is dumb, i'm inconsistant about what FPad means. 
+//       franca/backend/amd64/sysv.fr/retr doesn't like things like { w, pad 4 } for Option<i32>. 
+fn pad(fields: &mut Vec<Ferb::Field>, size: u32) {
+    if size == 0 { return };
+    match size {
+        1 => fields.push(Ferb::Field::Scalar(Ferb::FieldType::Fb)),
+        2 => fields.push(Ferb::Field::Scalar(Ferb::FieldType::Fh)),
+        4 => fields.push(Ferb::Field::Scalar(Ferb::FieldType::Fw)),
+        8 => fields.push(Ferb::Field::Scalar(Ferb::FieldType::Fl)),
+        _ => fields.push(Ferb::Field::Pad(size)),
     }
 }
 

@@ -15,6 +15,7 @@ As a very rough complexity estimate `llvm : cranelift :: cranelift : ferb`.
 - inline/global assembly
 - intrinsics: `std::{simd, arch}::*;`
 - tail calls
+- checked arithmetic
 
 there's lots of other stuff that is unfinished but doesn't require backend improvements to fix. 
 
