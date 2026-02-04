@@ -44,5 +44,3 @@ fn main() {
     
     println!("Hello World! {}", n);
 }
-
-// i'm cheating. see "TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO" in emit.rs

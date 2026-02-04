@@ -2,7 +2,8 @@
 // because i find it awkward to write the program inside out. 
 // it remains to be seen whether that was the right choice. 
 
-use rustc_const_eval::interpret::{AllocId, ConstAllocation, GlobalAlloc, Scalar, alloc_range};
+use rustc_const_eval::interpret::{AllocId, GlobalAlloc, Scalar, alloc_range};
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::DefId;
 use rustc_index::{Idx, IndexVec, bit_set::MixedBitSet};
 use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, NonDivergingIntrinsic, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}, pretty::MirWriter}, ty::{EarlyBinder, GenericArgsRef, Instance, InstanceKind, PseudoCanonicalInput, Ty, TyCtxt, TyKind, TypingEnv, adjustment::PointerCoercion, layout::{self, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers, TyAndLayout}, print::with_no_trimmed_paths}};
@@ -25,6 +26,13 @@ pub(crate) struct Emit<'f, 'tcx> {
     return_block: Ferb::BlkId,
     pub(crate) mir: &'tcx Body<'tcx>,
     pub(crate) caller_location: Option<Ferb::Ref>,
+    c: &'f mut Ctx<'tcx>,
+}
+
+struct Ctx<'tcx> {
+    allocations: FxHashMap<AllocId, Ferb::Id<Ferb::Sym>>,
+    finished: FxHashSet<Ferb::Id<Ferb::Sym>>,
+    _types: FxHashMap<Ty<'tcx>, Ferb::Ref>,
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -40,39 +48,85 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
     let mut m = Ferb::Module::new();
     // TODO: i inline better if they're sorted in callgraph order (def before use)
     let items = cgu.items_in_deterministic_order(tcx);
+    let mut c = Ctx {
+        allocations: FxHashMap::default(),
+        finished: FxHashSet::default(),
+        _types: FxHashMap::default(),
+    };
     for (it, _data) in items {
         match it {
             MonoItem::Fn(it) => {
-                emit_func(&mut m, tcx, it);
+                emit_func(&mut m, tcx, it, &mut c);
+                let id = m.intern(tcx.symbol_name(it).name);
+                c.finished.insert(id);
             },
             MonoItem::Static(def) => {
+                let alloc = tcx.reserve_alloc_id();  // :SLOW?
+                let mem = tcx.eval_static_initializer(def).unwrap();
+                tcx.set_alloc_id_memory(alloc, mem);
                 let (id, _) = def_symbol(&mut m, tcx, def, None);
-                let p = tcx.eval_static_initializer(def).unwrap();
-                let (bytes, segment, rel) = get_all_bytes(&mut m, tcx, p);
-                m.data(Ferb::Data {
-                    id,
-                    segment,
-                    template: Ferb::Template::Bytes(bytes),
-                    rel,
-                });
+                c.allocations.insert(alloc, id);
             },
             MonoItem::GlobalAsm(_) => todo!(),
         } 
     }
     crate::extra::maybe_create_entry_wrapper(&mut m, tcx, cgu);
+
+    loop {
+        // :SLOW
+        let pending = c.allocations.iter().filter(|(_, id)| !c.finished.contains(&id)).map(|(&k, &v)| (k, v)).collect::<Vec<_>>();
+        if pending.len() == 0 { break };
+        
+        for (p, id) in pending {
+            if c.finished.contains(&id) { continue };
+            let alloc = tcx.global_alloc(p);
+            let it = match alloc {
+                GlobalAlloc::Memory(it) => it,
+                GlobalAlloc::Static(def) => tcx.eval_static_initializer(def).unwrap(),
+                GlobalAlloc::Function { instance } => {
+                    let (_, instance) = def_symbol(&mut m, tcx, instance.def_id(), Some(instance.args));
+                    emit_func(&mut m, tcx, instance, &mut c);
+                    c.finished.insert(id);
+                    continue;
+                },
+                _ => todo!("{:?}", p),
+            };
+            
+            c.finished.insert(id);
+            let it = it.inner();
+            let rel = it.provenance().ptrs().iter().map(|(off, id)| {
+                let id = global_alloc(&mut m, tcx, &mut c, id.alloc_id()); 
+                Ferb::Reloc { addend: 0, off: off.bytes() as u32, id }
+            }).collect::<Vec<_>>();
+            let range = alloc_range(Size::from_bytes(0), it.size());
+            use rustc_ast::Mutability::*;
+            let segment = match it.mutability {
+                Not => Ferb::Seg::ConstantData,
+                Mut => Ferb::Seg::MutableData,
+            };
+            let bytes = it.get_bytes_unchecked(range);
+            m.data(Ferb::Data {
+                id,
+                segment,
+                template: Ferb::Template::Bytes(bytes),
+                rel,
+            });
+        }
+    }
+    
     m
 }
 
-fn emit_func<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>) {
+fn emit_func<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>, c: &mut Ctx<'tcx>) {
     if DEBUG {
         // fixes "diagnostics were expected but none were emitted"
-        with_no_trimmed_paths! {{ emit_func2(m, tcx, it); }};
+        with_no_trimmed_paths! {{ emit_func2(m, tcx, it, c); }};
     } else {
-        emit_func2(m, tcx, it);
+        emit_func2(m, tcx, it, c);
     }
 }
 
-fn emit_func2<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>) {
+fn emit_func2<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>, c: &mut Ctx<'tcx>) {
     let name = tcx.symbol_name(it).name;
     let id = m.intern(name);
     let mir = tcx.instance_mir(it.def);
@@ -103,6 +157,7 @@ fn emit_func2<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>)
         start_block,
         mir,
         caller_location: None,
+        c
     };
     
     let count = if mir.spread_arg.is_some() { 1 } else { mir.arg_count };
@@ -303,15 +358,6 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 if let &TyKind::FnDef(id, generics) = f_ty.kind() {
                     let (_, instance) = def_symbol(self.m, self.tcx, id, Some(generics));
                     caller_location = instance.def.requires_caller_location(self.tcx);
-                    
-                    // TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
-                    // how am i supposed to get this one on the list??
-                    // but also it's only a problem on macos so maybe it's something about weak symbols 
-                    // and this entry in the vtable isn't actually called. 
-                    let hack = "_RNvXs0_NtNtNtCs5KxHkbnNOyA_4core3ops8function5implsRNCINvNtCs4LOHw96cXq6_3std2rt10lang_startuE0INtB7_6FnOnceuE9call_onceCs8HFjjLcntvV_12custom_alloc";
-                    if self.tcx.symbol_name(instance).name == hack {
-                        emit_func(self.m, self.tcx, instance);
-                    };
                     
                     match instance.def {
                         InstanceKind::Intrinsic(def) => {
@@ -976,7 +1022,8 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     }
     
     fn global_alloc(&mut self, p: AllocId, off: Size) -> Ferb::Id<Ferb::Sym> {
-        global_alloc(self.m, self.tcx, p, off)
+        assert_eq!(off.bytes(), 0, "TODO: offset ptr");
+        global_alloc(self.m, self.tcx, self.c, p)
     }
     
     fn alloca(&mut self, size: usize) -> Ferb::Ref {
@@ -1042,6 +1089,21 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     fn is_wide(&self, ty: Ty<'tcx>) -> bool {
         is_wide(self.tcx, self.mono_ty(ty))
     }
+}
+
+fn global_alloc(m: &mut Ferb::Module, tcx: TyCtxt, c: &mut Ctx, p: AllocId) -> Ferb::Id<Ferb::Sym> {
+    if let Some(&id) = c.allocations.get(&p) { return id; }
+    
+    let id = match tcx.global_alloc(p) {
+        GlobalAlloc::Memory(_) => m.anon(),
+        GlobalAlloc::Static(def) => 
+            def_symbol(m, tcx, def, None).0,
+        GlobalAlloc::Function { instance } => 
+            def_symbol(m, tcx, instance.def_id(), Some(instance.args)).0,
+        _ => todo!(),
+    };
+    c.allocations.insert(p, id);
+    id
 }
 
 fn encoded_tag(variant: VariantIdx, tag_encoding: &TagEncoding<VariantIdx>) -> Option<u64> {
@@ -1147,51 +1209,6 @@ pub(crate) fn def_symbol<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, def: Def
     };
     let id = m.intern(tcx.symbol_name(instance).name);
     (id, instance)
-}
-
-fn global_alloc<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, p: AllocId, off: Size) -> Ferb::Id<Ferb::Sym> {
-    let p = tcx.global_alloc(p);
-    assert_eq!(off.bytes(), 0, "TODO: offset ptr");
-    match p {
-        GlobalAlloc::Memory(it) => {
-            let (bytes, segment, rel) = get_all_bytes(m, tcx, it);
-            assert!(segment == Ferb::Seg::ConstantData, "TODO: need to deduplicate them so you get the same pointer");
-            let id = m.anon();
-            m.data(Ferb::Data {
-                id,
-                segment,
-                template: Ferb::Template::Bytes(bytes),
-                rel,
-            });
-            id
-        }
-        GlobalAlloc::Static(def) => {
-            def_symbol(m, tcx, def, None).0
-        }
-        GlobalAlloc::Function { instance } => {
-            // TODO: is it ok that things are referenced here that we don't emit? i don't think so. 
-            //       but then how do we decide if it's in the other list too?
-            emit_func(m, tcx, instance);
-            let name = tcx.symbol_name(instance).name;
-            m.intern(name)
-        }
-        _ => todo!("{:?}", p),
-    }
-}
-
-fn get_all_bytes<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: ConstAllocation<'tcx>) -> (&'tcx [u8], Ferb::Seg, Vec<Ferb::Reloc>) {
-    let it = it.inner();
-    let rel = it.provenance().ptrs().iter().map(|(off, id)| {
-        let id = global_alloc(m, tcx, id.alloc_id(), Size::from_bytes(0)); 
-        Ferb::Reloc { addend: 0, off: off.bytes() as u32, id }
-    }).collect::<Vec<_>>();
-    let range = alloc_range(Size::from_bytes(0), it.size());
-    use rustc_ast::Mutability::*;
-    let seg = match it.mutability {
-        Not => Ferb::Seg::ConstantData,
-        Mut => Ferb::Seg::MutableData,
-    };
-    (it.get_bytes_unchecked(range), seg, rel)
 }
 
 fn is_wide<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {

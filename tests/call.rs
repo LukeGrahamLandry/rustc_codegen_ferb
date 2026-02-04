@@ -20,6 +20,7 @@ pub extern "C" fn main() -> i32 {
     
     track_caller();
     unsized_struct();
+    static mut _FNS: [*const fn(); 1] = [main as *const fn()];
     
     let mut x = 1;
     { let _ = defer(|| x = 0); };

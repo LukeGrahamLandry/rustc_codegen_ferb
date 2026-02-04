@@ -4,6 +4,7 @@
 // not needed yet: Dep, FTy, Fld, Addr, Asm
 //  
 #![allow(nonstandard_style)]
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::fmt::Debug;
 
@@ -400,15 +401,23 @@ impl<T> Idx<T> {
 
 // ugh, can't derive if the generic doesn't implement the trait
 
+impl<T> Eq for Id<T> {}
 impl<T> PartialEq for Id<T> {
     fn eq(&self, other: &Self) -> bool {
         self.off == other.off
     }
 }
 
+impl<T> Eq for Idx<T> {}
 impl<T> PartialEq for Idx<T> {
     fn eq(&self, other: &Self) -> bool {
         self.off == other.off && self.count == other.count
+    }
+}
+
+impl<T> Hash for Id<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.off.hash(state);
     }
 }
 
