@@ -32,7 +32,7 @@ pub(crate) struct Emit<'f, 'tcx> {
 struct Ctx<'tcx> {
     allocations: FxHashMap<AllocId, Ferb::Id<Ferb::Sym>>,
     finished: FxHashSet<Ferb::Id<Ferb::Sym>>,
-    _types: FxHashMap<Ty<'tcx>, Ferb::Ref>,
+    types: FxHashMap<Ty<'tcx>, Ferb::Ref>,
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -51,7 +51,7 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
     let mut c = Ctx {
         allocations: FxHashMap::default(),
         finished: FxHashSet::default(),
-        _types: FxHashMap::default(),
+        types: FxHashMap::default(),
     };
     for (it, _data) in items {
         match it {
@@ -72,6 +72,7 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
     }
     crate::extra::maybe_create_entry_wrapper(&mut m, tcx, cgu);
 
+    // TODO: make sure fxhashmap doesn't do the random order thing because i care about repro
     loop {
         // :SLOW
         let pending = c.allocations.iter().filter(|(_, id)| !c.finished.contains(&id)).map(|(&k, &v)| (k, v)).collect::<Vec<_>>();
@@ -142,7 +143,7 @@ fn emit_func2<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>,
             eprintln!("{}", String::from_utf8_lossy(&buf).into_owned());
     }
     
-    let ret = abi_type(m, tcx, ret_ty);
+    let ret = abi_type(m, tcx, c, ret_ty);
     let mut f = Ferb::Func::new(id, ret);
     let start_block = f.blk();
     let mut emit = Emit {
@@ -731,7 +732,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                                 let r = self.get_memory(dest);
                                 self.emit(o, Kw, (), value, r);
                             }
-                            layout = layout.for_variant(self, variant);
+                            layout = layout.for_variant(&WasteOfTime(self.tcx), variant);
                         }
                     }
                     Tuple | Array(_) | Closure(_, _) => (),
@@ -802,8 +803,8 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     assert!(src_def == dest_def);
                     // TODO: zst as the last field and unsized before it? 
                     let (src_layout, dest_layout) = (self.layout(src_ty), self.layout(dest_ty));
-                    src_ty = src_layout.field(self, src_layout.fields.count() - 1).ty;
-                    dest_ty = dest_layout.field(self, dest_layout.fields.count() - 1).ty;
+                    src_ty = src_layout.field(&WasteOfTime(self.tcx), src_layout.fields.count() - 1).ty;
+                    dest_ty = dest_layout.field(&WasteOfTime(self.tcx), dest_layout.fields.count() - 1).ty;
                 }
                 _ => todo!("{:?}", src_ty),
             }
@@ -812,7 +813,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     
     pub(crate) fn layout(&self, ty: Ty<'tcx>) -> TyAndLayout<'tcx> {
         let ty = self.mono_ty(ty);
-        self.layout_of(ty)
+        WasteOfTime(self.tcx).layout_of(ty)
     }
     
     fn emit_aggregate(&mut self, base: Ferb::Ref, layout: TyAndLayout<'tcx>, fields: &IndexVec<FieldIdx, Operand<'tcx>>) {
@@ -888,7 +889,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 }
                 Downcast(_, varient) => {
                     let layout = self.layout(parent_ty);
-                    let layout = layout.for_variant(self, varient);
+                    let layout = layout.for_variant(&WasteOfTime(self.tcx), varient);
                     let first = layout.layout.fields.index_by_increasing_offset().next().unwrap();
                     let inner = ty.projection_ty(self.tcx, it).ty;
                     (inner, self.offset(base, layout.fields.offset(first)))
@@ -1074,7 +1075,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
     
     pub(crate) fn abi_type(&mut self, ty: Ty<'tcx>) -> Ferb::Ret {
         let ty = self.mono_ty(ty);
-        abi_type(self.m, self.tcx, ty)
+        abi_type(self.m, self.tcx, self.c, ty)
     }
 
     fn ptr_result(&mut self, dest: Placement, src: Ferb::Ref, src_ty: Ty<'tcx>) -> Ferb::Ref {
@@ -1171,10 +1172,16 @@ fn val_cls<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> (Ferb::Cls, ()) {
 }
 
 fn layout_of<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>) -> TyAndLayout<'tcx> {
-    tcx.layout_of(PseudoCanonicalInput { value,  typing_env: TypingEnv::fully_monomorphized() }).unwrap()
+    tcx.layout_of(PseudoCanonicalInput { value, typing_env: TypingEnv::fully_monomorphized() }).unwrap()
 }
 
-fn abi_type<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Ferb::Ret {
+// TODO: it's probably a loosing game to try to use my abi stuff like this instead of rustc's. 
+//       because it's important to match calling convention even for non-extern-c so you can:
+//       - use precompiled standard library
+//       - compile dependencies with llvm optimisations
+//       so my backend should give you the option of being explicit about how you want to pass things
+//       instead of needing to reverse engineer a matching extern "C" signeture. 
+fn abi_type<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, c: &mut Ctx<'tcx>, ty: Ty<'tcx>) -> Ferb::Ret {
     let (k, _) = val_cls(tcx, ty);
     let layout = layout_of(tcx, ty);
     let size = layout.size.bytes_usize();
@@ -1184,20 +1191,83 @@ fn abi_type<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Ferb
     if !is_big(ty) && !is_wide(tcx, ty) {
         return Ferb::Ret::K(k);
     }
-    // TODO: proper abi
+    if let Some(&t) = c.types.get(&ty) { return Ferb::Ret::T(t) };
+    
+    use Ferb::Field::*;
+    let cases = match &layout.fields {
+        FieldsShape::Primitive => vec![vec![abi_field(m, tcx, c, ty)]],
+        FieldsShape::Union(count) => {
+            let mut cases = vec![];
+            for i in 0..count.get() {
+                let ty = layout.field(&WasteOfTime(tcx), i);
+                cases.push(vec![abi_field(m, tcx, c, ty.ty)]);
+            }
+            cases
+        },
+        &FieldsShape::Array { stride, count } => {
+            let mut fields = vec![];
+            let inner = layout.field(&WasteOfTime(tcx), 0);
+            let size = inner.layout.size.bytes();
+            let inner = abi_field(m, tcx, c, inner.ty);
+            for _ in 0..count {
+                fields.push(inner);
+                if size != stride.bytes() {
+                    fields.push(Pad(stride.bytes() as u32 - size as u32))
+                }
+            }
+            vec![fields]
+        }
+        FieldsShape::Arbitrary { offsets, in_memory_order } => {
+            let mut fields = vec![];
+            let mut off = 0;
+            for it in in_memory_order {
+                if offsets[*it].bytes() as u32 != off {
+                    fields.push(Pad(offsets[*it].bytes() as u32 - off))
+                }
+                let ty = layout.field(&WasteOfTime(tcx), it.as_usize());
+                if is_wide(tcx, ty.ty) {
+                    for _ in 0..2 {
+                        fields.push(Scalar(Ferb::FieldType::Fl));
+                    }
+                } else {
+                    fields.push(abi_field(m, tcx, c, ty.ty));
+                }
+                off += ty.layout.size.bytes() as u32;
+            }
+            if size as u32 != off {
+                fields.push(Pad(size as u32 - off))
+            }
+            vec![fields]
+        },
+    };
+    
     let t = m.typ(Ferb::TypeLayout {
         align: layout.align.bytes_usize(),
         size,
-        cases: match size {
-            1 => vec![vec![Ferb::Field::Scalar(Ferb::FieldType::Fb)]],
-            8 => vec![vec![Ferb::Field::Scalar(Ferb::FieldType::Fl)]],
-            16 => vec![vec![Ferb::Field::Scalar(Ferb::FieldType::Fl), Ferb::Field::Scalar(Ferb::FieldType::Fl)]],
-            24 => vec![vec![Ferb::Field::Scalar(Ferb::FieldType::Fl), Ferb::Field::Scalar(Ferb::FieldType::Fl), Ferb::Field::Scalar(Ferb::FieldType::Fl)]],
-            _ => vec![],
-        },
-        is_union: false,
+        cases,
+        is_union: matches!(layout.fields, FieldsShape::Union(_)),
     });
+    c.types.insert(ty, t);
     Ferb::Ret::T(t)
+}
+
+fn abi_field<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, c: &mut Ctx<'tcx>, ty: Ty<'tcx>) -> Ferb::Field {
+    let layout = layout_of(tcx, ty);
+    use Ferb::Field::*; use Ferb::FieldType::*;
+    match &layout.fields {
+        FieldsShape::Primitive => Scalar(if ty.is_floating_point() {
+            match layout.size.bytes() { 4 => Fs, 8 => Fd, _ => todo!(), }
+        } else {
+            match layout.size.bytes() { 1 => Fb, 2 => Fh, 4 => Fw, 8 => Fl, _ => todo!(), }
+        }),
+        _ => match abi_type(m, tcx, c, ty) {
+            Ferb::Ret::K(k) => Scalar(match k {
+                Kw => Fw, Kl => Fl, Ks => Fs, Kd => Fd,
+            }),
+            Ferb::Ret::Void => Pad(0),
+            Ferb::Ret::T(t) => Struct(t),
+        }
+    }
 }
 
 pub(crate) fn def_symbol<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, def: DefId, args: Option<GenericArgsRef<'tcx>>) -> (Ferb::Id<Ferb::Sym>, Instance<'tcx>) {
@@ -1246,23 +1316,25 @@ fn choose_op(op: BinOp, signed: bool) -> Ferb::O {
     }
 }
 
-impl<'tcx> HasDataLayout for Emit<'_, 'tcx> {
+struct WasteOfTime<'tcx>(TyCtxt<'tcx>);
+
+impl<'tcx> HasDataLayout for WasteOfTime<'tcx> {
     fn data_layout(&self) -> &rustc_abi::TargetDataLayout {
-        &self.tcx.data_layout
+        &self.0.data_layout
     }
 }
 
-impl<'tcx> HasTypingEnv<'tcx> for Emit<'_, 'tcx> {
+impl<'tcx> HasTypingEnv<'tcx> for WasteOfTime<'tcx> {
     fn typing_env(&self) -> TypingEnv<'tcx> {
         TypingEnv::fully_monomorphized()
     }
 }
-impl<'tcx> HasTyCtxt<'tcx> for Emit<'_, 'tcx> {
+impl<'tcx> HasTyCtxt<'tcx> for WasteOfTime<'tcx> {
     fn tcx(&self) -> TyCtxt<'tcx> {
-        self.tcx
+        self.0
     }
 }
-impl<'tcx> LayoutOfHelpers<'tcx> for Emit<'_, 'tcx> {
+impl<'tcx> LayoutOfHelpers<'tcx> for WasteOfTime<'tcx> {
     type LayoutOfResult = layout::TyAndLayout<'tcx>;
 
     fn handle_layout_err(&self, _: layout::LayoutError<'tcx>, _: Span, _: Ty<'tcx>) -> <Self::LayoutOfResult as layout::MaybeResult<layout::TyAndLayout<'tcx>>>::Error {
