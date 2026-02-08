@@ -302,7 +302,7 @@ impl Module {
     }
 
     pub fn size_of(&self, t: Ref) -> usize {
-        assert!(t.0 & 0b111 == 3);  // ::RType
+        assert!(t.0 & 0b111 == unsafe { std::mem::transmute(RefKind::RType) });
         let t = t.0 as usize >> 3;
         self.typ[t].size as usize
     }
@@ -311,6 +311,10 @@ impl Module {
         let sym = &self.sym[id.off as usize];
         let bytes = &self.str[sym.name.off as usize..sym.name.off as usize + sym.name.count as usize];
         str::from_utf8(bytes).unwrap()
+    }
+    
+    pub fn unfinished_symbols(&self) -> Vec<Id<Sym>> {
+        self.sym.iter().enumerate().filter(|(_, it)| it.segment == Seg::Invalid).map(|(i, _)| Id::new(i)).collect()
     }
 }
 

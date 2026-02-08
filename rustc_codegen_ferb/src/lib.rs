@@ -100,8 +100,11 @@ impl CodegenBackend for FerbCodegenBackend {
         } else { 
             (OutputType::Exe, ferb::Artifact::Exe)
         };
-        let OutFileName::Real(output_file) = outputs.path(ty) else {
-            panic!("TODO: OutFileName")
+        let output_file = if worker.need_linker {
+            outputs.temp_path_for_cgu(ty, &worker.cgu_name, sess.invocation_temp.as_deref())
+        } else {
+            let OutFileName::Real(it) = outputs.path(ty) else { todo!() };
+            it
         };
         
         let (arch, os) = translate_target(sess);

@@ -2,11 +2,12 @@
 // because i find it awkward to write the program inside out. 
 // it remains to be seen whether that was the right choice. 
 
+use rustc_codegen_ssa::base::is_call_from_compiler_builtins_to_upstream_monomorphization;
 use rustc_const_eval::interpret::{AllocId, GlobalAlloc, Scalar, alloc_range};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::DefId;
 use rustc_index::{Idx, IndexVec, bit_set::MixedBitSet};
-use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, NonDivergingIntrinsic, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}, pretty::MirWriter}, ty::{EarlyBinder, GenericArgsRef, Instance, InstanceKind, PseudoCanonicalInput, Ty, TyCtxt, TyKind, TypingEnv, adjustment::PointerCoercion, layout::{self, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers, TyAndLayout}, print::with_no_trimmed_paths}};
+use rustc_middle::{mir::{BasicBlock, BasicBlockData, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, NonDivergingIntrinsic, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind, UnOp, mono::{CodegenUnit, MonoItem}}, ty::{EarlyBinder, GenericArgsRef, Instance, InstanceKind, PseudoCanonicalInput, Ty, TyCtxt, TyKind, TypingEnv, adjustment::PointerCoercion, layout::{self, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers, TyAndLayout}, print::with_no_trimmed_paths}};
 use ferb::builder as Ferb;
 use Ferb::{J, O, Reflike, Cls::*};
 use rustc_abi::{ExternAbi, FieldIdx, FieldsShape, HasDataLayout, Size, TagEncoding, VariantIdx, Variants};
@@ -64,7 +65,7 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
                 let alloc = tcx.reserve_alloc_id();  // :SLOW?
                 let mem = tcx.eval_static_initializer(def).unwrap();
                 tcx.set_alloc_id_memory(alloc, mem);
-                let (id, _) = def_symbol(&mut m, tcx, def, None);
+                let id = get_symbol(&mut m, tcx, def, None);
                 c.allocations.insert(alloc, id);
             },
             MonoItem::GlobalAsm(_) => todo!(),
@@ -83,10 +84,18 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
             let alloc = tcx.global_alloc(p);
             let it = match alloc {
                 GlobalAlloc::Memory(it) => it,
-                GlobalAlloc::Static(def) => tcx.eval_static_initializer(def).unwrap(),
+                GlobalAlloc::Static(def) => {
+                    assert!(tcx.should_codegen_locally(get_instance(tcx, def, None)));
+                    tcx.eval_static_initializer(def).unwrap()
+                },
                 GlobalAlloc::Function { instance } => {
-                    let (_, instance) = def_symbol(&mut m, tcx, instance.def_id(), Some(instance.args));
-                    emit_func(&mut m, tcx, instance, &mut c);
+                    // TODO: i feel i should never have to emit here. 
+                    // if !should_codegen_locally, you can still get its body but all the callees won't have been in the list either and you'd have to infinitly pull in everything. 
+                    if tcx.should_codegen_locally(instance) {
+                        assert!(!tcx.instantiate_and_check_impossible_predicates((instance.def_id(), &instance.args)));
+                        let instance = get_instance(tcx, instance.def_id(), Some(instance.args));
+                        emit_func(&mut m, tcx, instance, &mut c);
+                    }
                     c.finished.insert(id);
                     continue;
                 },
@@ -106,10 +115,15 @@ pub(crate) fn emit<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Ferb::Mo
                 Mut => Ferb::Seg::MutableData,
             };
             let bytes = it.get_bytes_unchecked(range);
+            
             m.data(Ferb::Data {
                 id,
                 segment,
-                template: Ferb::Template::Bytes(bytes),
+                template: if bytes.iter().all(|&it| it == 0) {
+                    Ferb::Template::Zeroes(bytes.len())
+                } else {
+                    Ferb::Template::Bytes(bytes)
+                },
                 rel,
             });
         }
@@ -134,14 +148,6 @@ fn emit_func2<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>,
     let mono = TypingEnv::fully_monomorphized();
     let ret_ty = EarlyBinder::bind(mir.return_ty());
     let ret_ty = it.instantiate_mir_and_normalize_erasing_regions(tcx, mono, ret_ty);
-    
-    if DEBUG && false {
-            let mut buf = Vec::new();
-            let writer = MirWriter::new(tcx);
-            writer.write_mir_fn(mir, &mut buf).unwrap();
-            eprintln!("${}();", name);
-            eprintln!("{}", String::from_utf8_lossy(&buf).into_owned());
-    }
     
     let ret = abi_type(m, tcx, c, ret_ty);
     let mut f = Ferb::Func::new(id, ret);
@@ -342,7 +348,6 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 
                 let f_ty = func.ty(self.mir, self.tcx);
                 let f_ty = self.mono_ty(f_ty);
-                let mut callee = self.emit_operand(func, Placement::NewScalar(Kl));
                 // TODO: is this different from fn_abi_of_instance?
                 let sig = f_ty.fn_sig(self.tcx);  
                 
@@ -356,10 +361,12 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     }))
                     .collect::<Vec<_>>();
                 let mut caller_location = false;
+                let mut callee: Option<Ferb::Ref> = None;
                 if let &TyKind::FnDef(id, generics) = f_ty.kind() {
-                    let (_, instance) = def_symbol(self.m, self.tcx, id, Some(generics));
+                    let instance = get_instance(self.tcx, id, Some(generics));
                     caller_location = instance.def.requires_caller_location(self.tcx);
                     
+                    assert!(!is_call_from_compiler_builtins_to_upstream_monomorphization(self.tcx, instance));
                     match instance.def {
                         InstanceKind::Intrinsic(def) => {
                             assert!(!sig.c_variadic());
@@ -370,7 +377,7 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                         }
                         InstanceKind::Virtual(_, vtable_index) => {
                             assert!(!sig.c_variadic());
-                            callee = self.load_trait_object(&mut arg_vals[0], &mut arg_types[0], vtable_index);
+                            callee = Some(self.load_trait_object(&mut arg_vals[0], &mut arg_types[0], vtable_index));
                         }
                         InstanceKind::DropGlue(_, None) => {
                             // avoid linker error for nop drop
@@ -413,6 +420,9 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                     let r = self.caller_location(terminator.source_info);
                     self.emit(O::arg, Kl, (), r, ());
                 }
+                
+                // delay until after it can't be an intrinsic so don't bloat the Module with junk symbols. 
+                let callee = callee.unwrap_or_else(|| self.emit_operand(func, Placement::NewScalar(Kl)));
                 
                 let ret = sig.output();
                 let ret = ret.skip_binder();  // discards lifetimes but not generics i hope
@@ -984,7 +994,11 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                 // const known function gets here. the value is stored in the type field. 
                 match ty.kind() {
                     &TyKind::FnDef(def, args) => {
-                        let (id, _) = def_symbol(self.m, self.tcx, def, Some(args));
+                        let id = get_symbol(self.m, self.tcx, def, Some(args));
+                        if dest == Placement::Zst {
+                            // TODO: this is a problem. i'd rather never get here. format! does but print! doesn't
+                            return Ferb::Ref::Undef;
+                        }
                         assert!(dest != Placement::Zst);
                         self.scalar_result(dest, id, Kl)
                     },
@@ -1098,9 +1112,9 @@ fn global_alloc(m: &mut Ferb::Module, tcx: TyCtxt, c: &mut Ctx, p: AllocId) -> F
     let id = match tcx.global_alloc(p) {
         GlobalAlloc::Memory(_) => m.anon(),
         GlobalAlloc::Static(def) => 
-            def_symbol(m, tcx, def, None).0,
+            get_symbol(m, tcx, def, None),
         GlobalAlloc::Function { instance } => 
-            def_symbol(m, tcx, instance.def_id(), Some(instance.args)).0,
+            get_symbol(m, tcx, instance.def_id(), Some(instance.args)),
         _ => todo!(),
     };
     c.allocations.insert(p, id);
@@ -1200,7 +1214,9 @@ fn abi_type<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, c: &mut Ctx<'tcx>, ty
             let mut cases = vec![];
             for i in 0..count.get() {
                 let ty = layout.field(&WasteOfTime(tcx), i);
-                cases.push(vec![abi_field(m, tcx, c, ty.ty)]);
+                if ty.layout.size.bytes() != 0 {
+                    cases.push(vec![abi_field(m, tcx, c, ty.ty)]);
+                }
             }
             cases
         },
@@ -1227,7 +1243,9 @@ fn abi_type<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, c: &mut Ctx<'tcx>, ty
                         fields.push(Scalar(Ferb::FieldType::Fl));
                     }
                 } else {
-                    fields.push(abi_field(m, tcx, c, ty.ty));
+                    if ty.layout.size.bytes() != 0 {
+                        fields.push(abi_field(m, tcx, c, ty.ty));
+                    }
                 }
                 off = offsets[*it].bytes() as u32 + ty.layout.size.bytes() as u32;
             }
@@ -1278,15 +1296,17 @@ fn pad(fields: &mut Vec<Ferb::Field>, size: u32) {
     }
 }
 
-pub(crate) fn def_symbol<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, def: DefId, args: Option<GenericArgsRef<'tcx>>) -> (Ferb::Id<Ferb::Sym>, Instance<'tcx>) {
+pub(crate) fn get_instance<'tcx>(tcx: TyCtxt<'tcx>, def: DefId, args: Option<GenericArgsRef<'tcx>>) -> Instance<'tcx> {
     let span = tcx.def_span(def);
     let mono = TypingEnv::fully_monomorphized();
-    let instance = match args {
+    match args {
         Some(args) => Instance::expect_resolve(tcx, mono, def, args, span),
         None => Instance::mono(tcx, def),
-    };
-    let id = m.intern(tcx.symbol_name(instance).name);
-    (id, instance)
+    }
+}
+
+pub(crate) fn get_symbol<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, def: DefId, args: Option<GenericArgsRef<'tcx>>) -> Ferb::Id<Ferb::Sym> {
+    m.intern(tcx.symbol_name(get_instance(tcx, def, args)).name)
 }
 
 fn is_wide<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {

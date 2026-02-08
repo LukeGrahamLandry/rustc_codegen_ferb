@@ -11,7 +11,7 @@ use rustc_span::DUMMY_SP;
 use rustc_symbol_mangling::mangle_internal_symbol;
 use ferb::builder::*;
 
-use crate::{compiled_module, emit::{Emit, Placement, def_symbol}, translate_target};
+use crate::{compiled_module, emit::{Emit, Placement, get_instance, get_symbol}, translate_target};
 
 pub(crate) fn allocator_module(tcx: TyCtxt) -> Option<rustc_codegen_ssa::CompiledModule> {
     allocator_kind_for_codegen(tcx).map(|kind| {
@@ -71,10 +71,11 @@ fn allocator(tcx: TyCtxt<'_>, m: &mut Module, methods: &[AllocatorMethod]) {
 pub(crate) fn maybe_create_entry_wrapper<'tcx>(m: &mut Module, tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) {
     let Some((main_def, entry_type)) = tcx.entry_fn(()) else { return };
     let main_is_local = main_def.is_local();
-    let (rust_main, instance) = def_symbol(m, tcx, main_def, None);
+    let instance = get_instance(tcx, main_def, None);
     if (main_is_local && !cgu.contains_item(&MonoItem::Fn(instance))) || !cgu.is_primary() {
         return;
     }
+    let rust_main = get_symbol(m, tcx, main_def, None);
 
     let mut f = Func::new(m.intern("main"), Ret::K(Cls::Kw));
     let b = f.blk();
@@ -93,7 +94,7 @@ pub(crate) fn maybe_create_entry_wrapper<'tcx>(m: &mut Module, tcx: TyCtxt<'tcx>
 
     let EntryFnType::Main { sigpipe } = entry_type;
     let start_def = tcx.require_lang_item(LangItem::Start, DUMMY_SP);
-    let (start_fn, _) = def_symbol(m, tcx, start_def, Some(tcx.mk_args(&[main_ret_ty.into()])));
+    let start_fn = get_symbol(m, tcx, start_def, Some(tcx.mk_args(&[main_ret_ty.into()])));
     f.emit(b, O::arg, Cls::Kl, (), rust_main, ());
     f.emit(b, O::arg, Cls::Kl, (), argc, ());
     f.emit(b, O::arg, Cls::Kl, (), argv, ());
