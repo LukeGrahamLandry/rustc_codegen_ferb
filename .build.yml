@@ -1,7 +1,8 @@
 image: ubuntu/plucky
 sources:
-- "https://git.sr.ht/~lukegrahamlandry/franca#b1b282d1688ec71a28f8235b845df9658149f8da"
+- "https://git.sr.ht/~lukegrahamlandry/franca#965286f3aa1e22f409926d25ff51f8516690ef32"
 - "https://git.sr.ht/~lukegrahamlandry/rustc_codegen_ferb"
+- "https://github.com/LukeGrahamLandry/roland.git#b73ecb2900cd1b285797ede9e7720dcc858c71ed"
 packages:
 - "rustup"
 tasks:
@@ -10,4 +11,5 @@ tasks:
     ./boot/strap.sh -no-test
 - test: |
     cd rustc_codegen_ferb
-    ../franca/target/f.out tests/main.fr
+    rustup default stable
+    ../franca/target/f.out tests/main.fr -roland

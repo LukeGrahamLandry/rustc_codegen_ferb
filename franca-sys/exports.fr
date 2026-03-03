@@ -50,43 +50,64 @@ CompileCmd :: @struct {
     arch: Arch;
     os: Os;
     type: Qbe.OutputPurpose;
+    no_libc: bool;
+    no_interp: bool;  // in a sane world this would be the same as no_libc but people want to have thier own _start and still get relocations done by someone else via magic.
+    ok: bool;
 };
 
 fn compile_one(_: *Globals, arg: *CompileCmd) void #export = {
     call_in_stack(*CompileCmd, void, arg, fn(arg) => {
+        return :: local_return;
+    
         m := general_allocator().box_zeroed(Qbe.Module);
         Qbe'backend'init_module(m, (
             type = arg.type, 
             os = arg.os,  
             arch = arg.arch, 
-            wrap_entry_for_linux_libc = arg.type == .Exe,
+            wrap_entry_for_linux_libc = arg.type == .Exe && !arg.no_libc,
             exe_debug_symbol_table = true,
+            entry_point = arg.name,  // only relevant for .Exe
         ));
         m.set_debug_types(arg.logging, true);
         H :: *Qbe.Incremental.Header;
-        ::Result(H, Str);
-        header: H = or check(arg.frc) { e |
-            @panic("invalid frc file: %", e)
+        @match(check(arg.frc)) {
+            fn Ok(header) => Qbe'backend'load_all(header, m);
+            fn Err(msg0) => {
+                parse :: import("@/backend/meta/parse.fr").parse_and_compile;
+                @if_let(parse(m, arg.frc)) fn Err(msg1) =>
+                    return_error(@tfmt("{bad frc: %}\n{bad ssa: %}", msg0, msg1));
+            }
         };
-        Qbe'backend'load_all(header, m);
-        m.Qbe'backend'compile_suspended();
         
+        m.Qbe'backend'compile_suspended();
         if m.goal.type != .JitOnly {
             chunks := {m.target.finish_module}(m);
             arg.out = concat(chunks, general_allocator());
+            if arg.no_libc && arg.no_interp && arg.os == .linux {
+                import("@/backend/elf/emit.fr")'patch_out_interp_header(arg.out);
+            };
             drop(m);
         } else {
-            @if(is_linking_libc()) m.Qbe'fill_from_libc();
+            @if(is_linking_libc() && !arg.no_libc) m.Qbe'fill_from_libc();
             m.make_exec();
             p := m.get_addr(arg.name) 
-                || @panic("couldn't find %", arg.name);
+                || return_error(@tfmt("couldn't find %", arg.name));
             arg.p = p;
             arg.m = m;
+        };
+        arg.ok = true;
+        
+        return_error :: fn(msg: Str) => {
+            arg.out = msg;
+            arg.ok = false;
+            drop(m);
+            return()
         };
     });
 }
 
 fn drop_module(_: *Globals, arg: *CompileCmd) void #export = {
+    @if(!arg.ok) return();
     call_in_stack(*CompileCmd, void, arg, fn(arg) => {
         ::ptr_utils(@type arg.m[]);
         if !arg.m.is_null() {

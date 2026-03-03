@@ -44,9 +44,11 @@ fn main() {
     
     println!("Hello World! {}", n);
     
-    #[derive(Debug)] struct Foo { _a: i64 }
     #[cfg(target_arch="aarch64")]
+    {
+    #[derive(Debug)] struct Foo { _a: i64 }
     println!("{:?}", Foo { _a: 123 });
     // TODO: problem is need to pass wide things as pair, 
     //       the args are allowed to be split if you run out of registers in the middle
+    }
 }

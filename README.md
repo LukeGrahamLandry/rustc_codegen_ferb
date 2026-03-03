@@ -9,6 +9,7 @@ As a very rough complexity estimate `llvm : cranelift :: cranelift : ferb`.
 
 ## NOT YET IMPLEMENTED
 
+an incomplete list:
 - i128/u128, f16/f128
 - thread locals
 - unwinding, debug info

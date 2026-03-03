@@ -110,8 +110,8 @@ impl CodegenBackend for FerbCodegenBackend {
         let (arch, os) = translate_target(sess);
         let logging = &*std::env::var("FRANCA_DASH_d").unwrap_or_else(|_| String::new());
         // TODO: use threaded *CodegenShared from franca/backend/lib.fr instead of building up the whole module first
-        let obj = unsafe { ferb::compile_aot(&worker.m.finish(), logging, arch, os, artifact) };
-        std::fs::write(&output_file, obj).unwrap();
+        let obj = unsafe { ferb::compile_aot(&worker.m.finish(), "main", logging, arch, os, artifact, false, false) };
+        std::fs::write(&output_file, obj.unwrap()).unwrap();
         if ty == OutputType::Exe {
             std::fs::set_permissions(&output_file, Permissions::from_mode(0o777)).unwrap();
         };

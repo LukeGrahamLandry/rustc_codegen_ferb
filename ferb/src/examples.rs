@@ -38,8 +38,12 @@ fn jitted(m: Module, name: &[&str], then: impl FnOnce(&[u64])) {
             arch,
             os,
             kind: Artifact::Jit,
+            no_libc: true,
+            ok: true,
+            no_interp: true,
         };
         compile_one(fr, &mut cmd);
+        assert!(cmd.ok, "Backend Error: {:?}", String::from_utf8(cmd.out.bytes().to_vec()));
         then(&[cmd.p]);
         drop_module(fr, &mut cmd);
     };

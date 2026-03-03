@@ -1,6 +1,18 @@
 
 // run with FRANCA_DASH_d="Pdt" to see the ir
 main :: fn() void = {
+    test_rustc_codegen_ferb();
+    Syscall'chdir("..");
+    
+    // test someone else's compiler that uses qbe, forked to embed ferb (still uses the text interface tho). 
+    // (this is just another test of my backend api, the rust code is NOT compiled by rustc_codegen_ferb). 
+    @if(cli_args().contains(fn(it) => it[] == "-roland"))
+    if query_current_arch() == .x86_64 && query_current_os() == .linux {
+        test_roland();
+    };
+}
+
+test_rustc_codegen_ferb :: fn() void = {
     suffix := @match(query_current_os()) {
         fn macos() => "dylib";
         fn linux() => "so";
@@ -44,6 +56,21 @@ main :: fn() void = {
             @if(err.len != 0) @print("%\n%\n", out, err);
         };
     };
+}
+
+test_roland :: fn() void = {
+    Syscall'chdir("roland");
+    sh(@slice("cargo", "build", "--bin", "rolandc_cli", "--no-default-features", "--features", "ferb"));
+    ok, out, err := exec_and_catch("cargo", @slice("run", "--bin", "roland_test_runner", "--", "--cli", "target/debug/rolandc_cli", "tests/", "--amd64"), temp()); 
+    expected := "\x1b[1;32m338 \x1b[0msuccesses, \x1b[1;31m2 \x1b[0mfailures\n";
+    @assert(out.items().contains(expected), "results changed\n%%", out.items(), err.items());
+    fails :: @const_slice("external_procedures/unicode_external_proc.rol", "link/link_unresolved.rol");
+    @print("roland: %", out.items().slice(out.len - expected.len, out.len));
+    for fails { it |
+        @assert(err.items().contains(it), "expected to fail % but didn't\n%%", it, out.items(), err.items());
+        @eprint("- failed % (as expected)\n", it);
+    };
+    Syscall'chdir("..");
 }
 
 compile_and_run :: fn(args: []Str, exe: Str) Ty([]u8, []u8) = {

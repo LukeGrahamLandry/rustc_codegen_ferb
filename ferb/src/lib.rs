@@ -4,26 +4,32 @@ pub mod builder;
 #[cfg(test)]
 mod examples;
 
-pub unsafe fn compile_aot(frc: &[u8], logging: &str, arch: Arch, os: Os, kind: Artifact) -> Vec<u8> {
+/// SAFETY: good luck, have fun :)
+pub unsafe fn compile_aot(frc: &[u8], entry: &str, logging: &str, arch: Arch, os: Os, kind: Artifact, no_libc: bool, no_interp: bool) -> Result<Vec<u8>, String> {
     use franca_sys::*;
-    assert_eq!(frc[0..8], ir::MAGIC.to_le_bytes());
     unsafe {
         let fr = init_globals();
         let mut cmd = CompileCmd {
             frc: Slice::from(frc),
             out: Slice::from("".as_bytes()),
-            name: Slice::from("".as_bytes()),
+            name: Slice::from(entry.as_bytes()),
             logging: Slice::from(logging.as_bytes()),
             p: 0,
             m: 0,
             arch,
             os,
             kind,
+            no_libc,
+            ok: true,
+            no_interp,
         };
         compile_one(fr, &mut cmd);
         let out = cmd.out.bytes().to_vec();
+        if !cmd.ok {
+            return Err(format!("I don't like those bytes;\n{}", String::from_utf8(out).as_deref().unwrap_or("[ICE: msg wasn't utf8]")));
+        }
         drop_module(fr, &mut cmd);
-        out
+        Ok(out)
     }
 }
 

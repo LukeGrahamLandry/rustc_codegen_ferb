@@ -20,10 +20,10 @@ pub(crate) fn allocator_module(tcx: TyCtxt) -> Option<rustc_codegen_ssa::Compile
         let names = &mut CodegenUnitNameBuilder::new(tcx);
         let name = names.build_cgu_name(LOCAL_CRATE, &["crate"], Some("allocator")).to_string();
         let (arch, os) = translate_target(tcx.sess);
-        let obj = unsafe { ferb::compile_aot(&*m.finish(), "", arch, os, ferb::Artifact::Relocatable) };
+        let obj = unsafe { ferb::compile_aot(&*m.finish(), "main", "", arch, os, ferb::Artifact::Relocatable, false, false) };
         let outputs = &tcx.output_filenames(());
         let output_file = outputs.temp_path_for_cgu(OutputType::Object, &name, tcx.sess.invocation_temp.as_deref());
-        std::fs::write(&output_file, obj).unwrap();
+        std::fs::write(&output_file, obj.unwrap()).unwrap();
         compiled_module(name, ModuleKind::Allocator, Some(output_file))
     })
 }

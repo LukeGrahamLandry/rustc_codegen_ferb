@@ -24,6 +24,9 @@ pub struct CompileCmd<'a> {
     pub arch: Arch,
     pub os: Os,
     pub kind: Artifact,
+    pub no_libc: bool,
+    pub no_interp: bool,
+    pub ok: bool,
 }
 
 unsafe extern "C" {
