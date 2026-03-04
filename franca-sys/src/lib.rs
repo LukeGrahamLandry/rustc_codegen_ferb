@@ -15,9 +15,13 @@ pub struct Slice<'a> {
 
 #[repr(C)]
 pub struct CompileCmd<'a> {
+    // .frc ir bytes or a string of qbe .ssa text ir. 
     pub frc: Slice<'a>,
+    // if kind != Jit this will return the compiled artifact bytes.
     pub out: Slice<'a>,  // lie!
+    // name of the entry point function. if kind == Jit, its address will be returned in `p`
     pub name: Slice<'a>,
+    // string of characters representing which opt passes to log to stderr (similar to qbe's -d argument)
     pub logging: Slice<'a>,    
     pub p: u64,
     pub m: u64,
@@ -26,6 +30,7 @@ pub struct CompileCmd<'a> {
     pub kind: Artifact,
     pub no_libc: bool,
     pub no_interp: bool,
+    // returns status. if false, `out` contains the error message.
     pub ok: bool,
 }
 

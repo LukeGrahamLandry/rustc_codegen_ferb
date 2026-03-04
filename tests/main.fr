@@ -7,9 +7,7 @@ main :: fn() void = {
     // test someone else's compiler that uses qbe, forked to embed ferb (still uses the text interface tho). 
     // (this is just another test of my backend api, the rust code is NOT compiled by rustc_codegen_ferb). 
     @if(cli_args().contains(fn(it) => it[] == "-roland"))
-    if query_current_arch() == .x86_64 && query_current_os() == .linux {
         test_roland();
-    };
 }
 
 test_rustc_codegen_ferb :: fn() void = {
@@ -61,16 +59,33 @@ test_rustc_codegen_ferb :: fn() void = {
 test_roland :: fn() void = {
     Syscall'chdir("roland");
     sh(@slice("cargo", "build", "--bin", "rolandc_cli", "--no-default-features", "--features", "ferb"));
-    ok, out, err := exec_and_catch("cargo", @slice("run", "--bin", "roland_test_runner", "--", "--cli", "target/debug/rolandc_cli", "tests/", "--amd64"), temp()); 
-    expected := "\x1b[1;32m338 \x1b[0msuccesses, \x1b[1;31m2 \x1b[0mfailures\n";
-    @assert(out.items().contains(expected), "results changed\n%%", out.items(), err.items());
-    fails :: @const_slice("external_procedures/unicode_external_proc.rol", "link/link_unresolved.rol");
-    @print("roland: %", out.items().slice(out.len - expected.len, out.len));
-    for fails { it |
-        @assert(err.items().contains(it), "expected to fail % but didn't\n%%", it, out.items(), err.items());
-        @eprint("- failed % (as expected)\n", it);
+
+    if query_current_arch() == .x86_64 && query_current_os() == .linux {
+        args := @slice("run", "--bin", "roland_test_runner", "--", "--cli", "target/debug/rolandc_cli", "tests/", "--amd64"); 
+        fails := @slice("external_procedures/unicode_external_proc.rol", "link/link_unresolved.rol");
+        check_fails(args, fails);
+    };
+    if true {  // their wasm backend with my import_wasm. doesn't involve the ferb rust bindings. 
+        franca := get_executable_path(temp());
+        sh(@slice(franca, "examples/default_driver.fr", "build", "../franca/examples/import_wasm/run.fr", "-o", "target/w.out"));
+        args := @slice("run", "--bin", "roland_test_runner", "--", "--cli", "target/debug/rolandc_cli", "tests/", "--wasm-executor", "target/w.out", "--no-wasm-validate");
+        fails := @const_slice("std/ryu/ryu_f64.rol", "std/ryu/ryu_f32.rol");
+        check_fails(args, fails);
     };
     Syscall'chdir("..");
+    
+    check_fails :: fn(args: []Str, fails: []Str) void = {
+        ::display_slice(Str);
+        @eprintln("%", args);
+        ok, out, err := exec_and_catch("cargo", args, temp()); 
+        expected := @tfmt("\x1b[1;32m% \x1b[0msuccesses, \x1b[1;31m% \x1b[0mfailures\n", 340 - fails.len, fails.len);
+        @assert(out.items().contains(expected), "results changed\n%%", out.items(), err.items());
+        @print("roland: %", out.items().slice(out.len - expected.len, out.len));
+        for fails { it |
+            @assert(err.items().contains(it), "expected to fail % but didn't\n%%", it, out.items(), err.items());
+            @eprint("- failed % (as expected)\n", it);
+        };
+    }
 }
 
 compile_and_run :: fn(args: []Str, exe: Str) Ty([]u8, []u8) = {

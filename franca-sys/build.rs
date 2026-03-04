@@ -11,6 +11,9 @@ pub fn main() {
     println!("cargo::rustc-link-lib=franca");
     println!("cargo::rustc-link-search={}", dir);
     
+    let linkage = std::env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or(String::new());
+    let host_libc = if linkage.contains("crt-static") { "-libc-sta" } else { "-libc-dyn" };
+    
     // it will only look for a .a file but it seems fine that the contents is just a .o file without the wrapper. 
     let a_path = &*format!("{}/libfranca.a", dir);
     let franca = find_compiler();
@@ -22,7 +25,8 @@ pub fn main() {
                 "-keep-names",
                 "-arch", arch, "-os", os,
                 "-c", 
-                if var("OPT_LEVEL") == "0" { "-safe" } else { "-unsafe" }
+                if var("OPT_LEVEL") == "0" { "-safe" } else { "-unsafe" },
+                host_libc
         ])
         .output()
         .expect("run franca");

@@ -1,8 +1,8 @@
 image: ubuntu/plucky
 sources:
-- "https://git.sr.ht/~lukegrahamlandry/franca#965286f3aa1e22f409926d25ff51f8516690ef32"
+- "https://git.sr.ht/~lukegrahamlandry/franca#e9f5119a1a6dd4c40d049545863b7aa5ea922b90"
 - "https://git.sr.ht/~lukegrahamlandry/rustc_codegen_ferb"
-- "https://github.com/LukeGrahamLandry/roland.git#b73ecb2900cd1b285797ede9e7720dcc858c71ed"
+- "https://github.com/LukeGrahamLandry/roland.git#d061c1076e37594b13444dd6715f7b0f3d402c9d"
 packages:
 - "rustup"
 tasks:
