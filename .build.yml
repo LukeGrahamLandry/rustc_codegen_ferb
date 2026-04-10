@@ -1,6 +1,6 @@
 image: ubuntu/plucky
 sources:
-- "https://git.sr.ht/~lukegrahamlandry/franca#e9f5119a1a6dd4c40d049545863b7aa5ea922b90"
+- "https://git.sr.ht/~lukegrahamlandry/franca#c59b66b5c7b919a073a43d1acf18167715a62f80"
 - "https://git.sr.ht/~lukegrahamlandry/rustc_codegen_ferb"
 - "https://github.com/LukeGrahamLandry/roland.git#d061c1076e37594b13444dd6715f7b0f3d402c9d"
 packages:

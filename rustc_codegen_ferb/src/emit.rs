@@ -168,6 +168,7 @@ fn emit_func2<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>,
     };
     
     let count = if mir.spread_arg.is_some() { 1 } else { mir.arg_count };
+    let mut wide_pairs = vec![];  // :SplatWidePointer
     for local in 1..count+1 {
         let local = Local::new(local);
         let ty = emit.mono_ty(mir.local_decls[local].ty);
@@ -180,8 +181,15 @@ fn emit_func2<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>,
                 Placement::Scalar(r, k)
             }
             Ferb::Ret::T(t) => {
-                emit.f.emit(emit.b, O::parc, Kl, r, t, ());
                 let size = emit.layout(ty).size.bytes_usize();
+                if emit.is_wide(ty) {
+                    let a = emit.f.tmps::<2>();
+                    emit.emit(O::par, Kl, a[0], (), ());
+                    emit.emit(O::par, Kl, a[1], (), ());
+                    wide_pairs.push((r, a));
+                } else {
+                    emit.emit(O::parc, Kl, r, t, ());
+                }
                 Placement::Blit(r, size)
             }
         };
@@ -191,18 +199,29 @@ fn emit_func2<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>,
     if let Some(args_tuple) = mir.spread_arg {
         assert!(mir.arg_count == 2 && args_tuple.as_u32() == 2);
 
-        let ty = mir.local_decls[Local::new(2)].ty;
+        let ty = mir.local_decls[args_tuple].ty;
         let ty = emit.mono_ty(ty);
         let TyKind::Tuple(inner) = ty.kind() else { todo!("{:?}", ty) };
         
         let mut arg_vals = vec![];
         for ty in inner.iter() {
+            let wide = emit.is_wide(ty);
             let ty = emit.abi_type(ty);
             let r = emit.f.tmp();
             match ty {
                 Ferb::Ret::K(k) => emit.emit(O::par, k, r, (), ()),
                 Ferb::Ret::Void => (),
-                Ferb::Ret::T(t) => emit.emit(O::parc, Kl, r, t, ()),
+                Ferb::Ret::T(t) => {
+                    if wide {
+                        let a = emit.f.tmps::<2>();
+                        emit.emit(O::par, Kl, a[0], (), ());
+                        emit.emit(O::par, Kl, a[1], (), ());
+                        wide_pairs.push((r, a));
+                    } else {
+                        emit.emit(O::parc, Kl, r, t, ());
+                    }
+                    emit.emit(O::parc, Kl, r, t, ());
+                }
             };
             arg_vals.push(r);
         }
@@ -227,6 +246,13 @@ fn emit_func2<'tcx>(m: &mut Ferb::Module, tcx: TyCtxt<'tcx>, it: Instance<'tcx>,
         }
     } else {
         emit.caller_location_par();
+    }
+    
+    for (r, a) in wide_pairs {
+        emit.emit(O::alloc8, Kl, r, 16, ());
+        let r2 = emit.offset(r, Size::from_bytes(8));
+        emit.emit(O::storel, Kw, (), a[0], r);
+        emit.emit(O::storel, Kw, (), a[1], r2);
     }
     if DEBUG {
         let loc = tcx.def_span(it.def.def_id());
@@ -408,7 +434,15 @@ impl<'f, 'tcx> Emit<'f, 'tcx> {
                             self.f.emit(self.b, O::arg, k, (), r, ());
                         }
                         Ferb::Ret::T(t) => {
-                            self.f.emit(self.b, O::argc, Kl, (), t, r);
+                            if self.is_wide(args[i].node.ty(self.mir, self.tcx)) {
+                                // :SplatWidePointer
+                                // wide pointers are passed as two scalars, this is very similar to what the c abi would do anyway for a struct but not the same when it runs out of registers part way through. 
+                                let (a, b) = (self.get_pair_slot(r, true), self.get_pair_slot(r, false));
+                                self.f.emit(self.b, O::arg, Kl, (), a, ());
+                                self.f.emit(self.b, O::arg, Kl, (), b, ());
+                            } else {
+                                self.f.emit(self.b, O::argc, Kl, (), t, r);
+                            }
                         }
                     }
                 }

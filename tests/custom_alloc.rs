@@ -44,11 +44,7 @@ fn main() {
     
     println!("Hello World! {}", n);
     
-    #[cfg(target_arch="aarch64")]
-    {
+    // on x86_64 :SplatWidePointer makes an abi difference (and would break without when using precompiled standard library)
     #[derive(Debug)] struct Foo { _a: i64 }
     println!("{:?}", Foo { _a: 123 });
-    // TODO: problem is need to pass wide things as pair, 
-    //       the args are allowed to be split if you run out of registers in the middle
-    }
 }

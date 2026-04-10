@@ -6,7 +6,7 @@ Globals :: @struct {
     stack: AlignedStack;
     lock: i32;
 };
-globals :: @static(Globals);
+globals :: @static_mut zeroed(Globals);
 
 host_os :: {
     // when compiled by build.rs, it always passes -arch,-os. 
